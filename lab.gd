@@ -403,10 +403,10 @@ func _analyze_chord(frames: PackedVector2Array, display: bool) -> void:
 		names.append(key_name)
 		strengths.append("%s %d%%" % [key_name, roundi(100 * keys[key])])
 	note.text = "  ".join(names) if not names.is_empty() else "—"
-	detail.text = "   ".join(strengths) if not strengths.is_empty() else "No active keys"
+	detail.text = "Fitted strength · " + "   ".join(strengths) if not strengths.is_empty() else "No active keys"
 	metrics.text = "%.0f dBFS · %.1f ms analysis" % [db, usec / 1000.0]
 	if replay == null:
-		status.text = "Listening · Relative key strengths"
+		status.text = "Listening"
 		var discarded := capture.get_discarded_frames() - discarded_at_start
 		if skipped_hops > 0 or discarded > 0:
 			status.text = "Skipped %d hops · %d capture frames lost" % [skipped_hops, discarded]

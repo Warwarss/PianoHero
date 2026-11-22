@@ -134,6 +134,7 @@ The two-key fit wins this comparison. Even if we give the one-key fit its best p
 | `gram[key][other]` | \(w_j^\top w_k\), how much two templates overlap. |
 | `delta := maxf(-gains[key], correlation[key] - penalty)` | The change that best improves that one gain, clamped so the gain stays nonnegative. |
 | `gains[key] <= 0.21 * peak` | Suppresses keys at or below 21% of the strongest fitted gain. It compares fitted amplitudes. |
+| `_note_fitness(gain, residual_match, observed_energy)` | Checks that the fitted note prevents at least 4% of the measured spectrum's squared magnitude in reconstruction error. |
 
 ### Why one update is a dot product minus the penalty
 
@@ -164,9 +165,20 @@ $$
 
 That inner product is already in the Gram matrix. The code can update every candidate score without rebuilding the whole residual spectrum after each gain change. A large dot product is exactly what you expect for templates with shared partials. It also means the two columns can trade off some gain with only a small change in the fit.
 
+### How much does each fitted note help?
+
+Once the fit is done, imagine removing note \(j\) while holding the other gains fixed. Its contribution \(h_jw_j\) goes back into the residual. The increase in squared error, divided by the measured spectrum's squared magnitude, is the fitness of the note.
+
+$$
+\frac{\|r+h_jw_j\|^2-\|r\|^2}{\|y\|^2}
+=\frac{h_j^2+2h_j w_j^\top r}{\|y\|^2}.
+$$
+
+A note needs a fitness of at least 0.04 to appear. This measures the contribution to the fit at the current gains. It is distinct from the strength shown in the UI, which divides a key's gain by the strongest gain in the frame.
+
 ### Where the current octave rule comes in
 
-After fitting the gains, the code applies a separate filter for weak candidates that line up with harmonics **3 through 10** of a lower reported key. C5 is about **2 times** C4, so it bypasses this filter. Including harmonic 2 would suppress some phantom C5s. It would also suppress some deliberately played soft C5s because both can produce a small gain. Your odd/even proposal provides evidence for deciding which case we have instead of using only a gain ratio. [Optimization and post-filter code](chord_detector.gd#L144)
+After fitting the gains, the code checks octave pairs using the odd-harmonic method below. A separate filter handles harmonics **3 through 10** of a lower reported key. The octave check estimates the lower key from its odd harmonics, allows a margin on its predicted contribution, and looks for evidence in the upper key's own odd harmonics. Those upper odd harmonics are shared frequencies for the pair. The margin is 30% for a learned lower key and 10% for a generic one. [Optimization and post-filter code](chord_detector.gd)
 
 ## 6. Put your odd/even idea into an explicit detector
 
@@ -215,7 +227,7 @@ looks exactly like a C4+C5 mixture if \(u=h_5w_5\) in the ideal model. The spect
 
 **Time gives us another clue.** Play C4 and let it ring. Then strike C5. If the even regions jump together while the C4 odd regions continue their previous decay, that favors a new C5 strike. If you play the two keys simultaneously, that clue is weaker because all the regions rise together. The current solver starts with the previous gains for speed, but its objective has no model of an independent hammer strike. An analysis of changes between windows would add information the current fit does not explicitly use.
 
-For the octave problem in this project, I would use the current NMF to propose candidates and then check suspicious octave pairs. Estimate C4 from regions where C5 contributes little, account for known other notes, and ask whether the shared residual is supported by several C5 partials or a fresh attack. This keeps a real octave playable while targeting the specific error you heard.
+The project now uses NMF to propose candidates and checks octave pairs afterward. It subtracts the fitted contributions of other strong candidates, estimates C4 from its odd regions, then tests the shared residual against C5's odd regions. For a learned lower key, the check also asks for evidence above C5's fundamental when the upper template has usable odd overtones. This prevents a single shared peak from carrying the decision. The margins are prototype settings. A detector that also tracks fresh attacks would have additional evidence for quiet C5 strikes.
 
 ## 8. Check your understanding
 
