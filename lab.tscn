@@ -69,6 +69,11 @@ text = "Replay test"
 size_flags_horizontal = 3
 tooltip_text = "Analyze labeled recordings without using the microphone."
 
+[node name="Solver" type="OptionButton" parent="Margin/Scroll/Column"]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(0, 44)
+
 [node name="Profile" type="CheckButton" parent="Margin/Scroll/Column"]
 unique_name_in_owner = true
 visible = false

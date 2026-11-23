@@ -31,6 +31,7 @@ const LEARNING_GATE_DB := -45.0
 @onready var tuning_label: Label = %Tuning
 @onready var mode: OptionButton = %Mode
 @onready var replay_button: Button = %Replay
+@onready var solver_choice: OptionButton = %Solver
 @onready var profile: CheckButton = %Profile
 @onready var learn_key: OptionButton = %LearnKey
 @onready var learn: Button = %Learn
@@ -76,6 +77,9 @@ func _ready() -> void:
 	mode.add_item("Chord mode")
 	mode.item_selected.connect(_mode_changed)
 	replay_button.pressed.connect(_toggle_replay)
+	solver_choice.add_item("Solver · Squared error", ChordDetector.Solver.SQUARED_ERROR)
+	solver_choice.add_item("Solver · β-divergence (0.5)", ChordDetector.Solver.BETA_HALF)
+	solver_choice.item_selected.connect(_solver_changed)
 	learn.pressed.connect(_toggle_learning)
 	profile.toggled.connect(_profile_changed)
 	learn_key.add_item("All keys (A0–C8)", 0)
@@ -94,6 +98,7 @@ func _ready() -> void:
 func _mode_changed(_index: int) -> void:
 	var chords := mode.selected == 1
 	replay_button.visible = chords
+	solver_choice.visible = chords
 	profile.visible = chords
 	%LearningControls.visible = chords
 	%Hint.text = "Play piano notes together, from A0 to C8." if chords else "Play one note at a time, from C3 to C6."
@@ -103,6 +108,10 @@ func _mode_changed(_index: int) -> void:
 	metrics.text = ""
 	status.text = "Listening" if listening else "Ready to listen"
 	_reset_analysis()
+
+func _solver_changed(index: int) -> void:
+	chord_detector.solver = solver_choice.get_item_id(index) as ChordDetector.Solver
+	chord_detector.reset()
 
 func _reset_analysis() -> void:
 	sample_rate = AudioServer.get_mix_rate()
@@ -426,6 +435,7 @@ func _toggle_replay() -> void:
 	calibrate.disabled = true
 	learn.disabled = true
 	profile.disabled = true
+	solver_choice.disabled = true
 	replay_button.text = "Stop replay"
 
 func _advance_replay(delta: float) -> void:
@@ -434,7 +444,8 @@ func _advance_replay(delta: float) -> void:
 		if replay.finished():
 			var report := replay.report()
 			_end_replay()
-			%Results.dialog_text = "3 consecutive exact updates · % exact\n\n" + report
+			var solver_name := solver_choice.get_item_text(solver_choice.selected)
+			%Results.dialog_text = solver_name + "\n3 consecutive exact updates · % exact\n\n" + report
 			%Results.popup_centered()
 			return
 		if replay.cursor_ms > replay_time * 1000:
@@ -446,6 +457,7 @@ func _end_replay() -> void:
 	mode.disabled = false
 	toggle.disabled = false
 	calibrate.disabled = false
+	solver_choice.disabled = false
 	replay_button.text = "Replay test"
 	_stop()
 	_show_reference()

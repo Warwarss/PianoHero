@@ -10,11 +10,10 @@ const HOP_SECONDS := 0.010
 const KEYS := 88
 const FIRST_KEY := 21
 const MAX_UPDATES := 24
-const OCTAVE := 12
-const LEARNED_OCTAVE_VARIATION := 0.30
-const GENERIC_OCTAVE_VARIATION := 0.10
-const MIN_ODD_TEMPLATE_ENERGY := 0.05
 const MIN_NOTE_FITNESS := 0.04
+const BETA_UPDATES := 12
+
+enum Solver { SQUARED_ERROR, BETA_HALF }
 
 var permutation := PackedInt32Array()
 var taper := PackedFloat32Array()
@@ -24,12 +23,11 @@ var spectrum := PackedFloat32Array()
 var bin_weights := PackedFloat32Array()
 var indices: Array[PackedInt32Array] = []
 var columns: Array[PackedFloat32Array] = []
-var odd_partials: Array[PackedInt32Array] = []
-var template_spectra: Array[PackedFloat32Array] = []
 var gram: Array[PackedFloat32Array] = []
 var gains := PackedFloat32Array()
 var tuning := 0.0
 var configured_templates := {}
+var solver := Solver.SQUARED_ERROR
 
 func _init() -> void:
 	fft.resize(SIZE)
@@ -55,10 +53,9 @@ func configure(a4: float, personal_templates: Dictionary = {}) -> void:
 	configured_templates = personal_templates.duplicate()
 	indices.clear()
 	columns.clear()
-	odd_partials.clear()
-	template_spectra.clear()
 	gram.clear()
 	var bank: PackedByteArray = BANK.get_meta("spectra")
+	var template_spectra: Array[PackedFloat32Array] = []
 	for key in KEYS:
 		var bins := PackedInt32Array()
 		var values := PackedFloat32Array()
@@ -95,15 +92,6 @@ func configure(a4: float, personal_templates: Dictionary = {}) -> void:
 		template_spectra.append(column)
 		indices.append(bins)
 		columns.append(values)
-		var fundamental := a4 * pow(2.0, (FIRST_KEY + key - 69) / 12.0)
-		var odd_bins := PackedInt32Array()
-		for b in bins:
-			var hz := b * RATE / SIZE
-			var partial := roundi(hz / fundamental)
-			var tolerance := minf(0.35 * fundamental, 2.0 * RATE / SIZE + 0.015 * hz)
-			if partial % 2 == 1 and absf(hz - partial * fundamental) <= tolerance:
-				odd_bins.append(b)
-		odd_partials.append(odd_bins)
 	# Precompute W'W. The bounded solver only visits 88 values per update.
 	for key in KEYS:
 		var overlaps := PackedFloat32Array()
@@ -180,8 +168,36 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 		reset()
 		return {}
 
+	if solver == Solver.BETA_HALF:
+		_fit_beta_half(correlation, strongest)
+	else:
+		_fit_squared_error(correlation, strongest)
+	var peak := 0.0
+	for gain in gains:
+		peak = maxf(peak, gain)
+	var minimum_gain := 0.21 * peak
+	var result := {}
+	for key in KEYS:
+		if gains[key] <= minimum_gain:
+			continue
+		if _note_fitness(gains[key], correlation[key], power) < MIN_NOTE_FITNESS:
+			continue
+		# With a different piano, one strong upper partial can remain after
+		# fitting its key. Require stronger evidence at overlapping partials.
+		var ambiguous := false
+		for lower: int in result:
+			var ratio := pow(2.0, (FIRST_KEY + key - lower) / 12.0)
+			var partial := roundi(ratio)
+			if partial >= 3 and partial <= 10 and absf(ratio - partial) < 0.012 * partial:
+				if gains[key] < 0.38 * gains[lower - FIRST_KEY]:
+					ambiguous = true
+					break
+		if not ambiguous:
+			result[FIRST_KEY + key] = gains[key] / peak
+	return result
+
+func _fit_squared_error(correlation: PackedFloat32Array, strongest: float) -> void:
 	# Coordinate descent on 0.5 * ||W*h - spectrum||² + penalty * sum(h).
-	# Start from the previous frame. Unit-norm columns have unit diagonal.
 	var penalty := 0.10 * strongest
 	for key in KEYS:
 		if gains[key] > 0:
@@ -198,87 +214,49 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 			break
 		gains[best] = maxf(0.0, gains[best] + change)
 		_subtract_column(correlation, best, change)
-	var peak := 0.0
-	for gain in gains:
-		peak = maxf(peak, gain)
-	var minimum_gain := 0.21 * peak
-	var result := {}
+
+func _fit_beta_half(correlation: PackedFloat32Array, strongest: float) -> void:
+	var predicted := PackedFloat32Array()
+	var numerator_bins := PackedFloat32Array()
+	var denominator_bins := PackedFloat32Array()
+	predicted.resize(BINS)
+	numerator_bins.resize(BINS)
+	denominator_bins.resize(BINS)
+	var floor := 0.001 * strongest
 	for key in KEYS:
-		if gains[key] <= minimum_gain:
-			continue
-		if _note_fitness(gains[key], correlation[key], power) < MIN_NOTE_FITNESS:
-			continue
-		var lower_octave := key - OCTAVE
-		if result.has(FIRST_KEY + lower_octave) and not _supports_octave(lower_octave, key, minimum_gain):
-			continue
-		# With a different piano, one strong upper partial can remain after
-		# fitting its key. Require stronger evidence at overlapping partials.
-		var ambiguous := false
-		for lower: int in result:
-			var ratio := pow(2.0, (FIRST_KEY + key - lower) / 12.0)
-			var partial := roundi(ratio)
-			if partial >= 3 and partial <= 10 and absf(ratio - partial) < 0.012 * partial:
-				if gains[key] < 0.38 * gains[lower - FIRST_KEY]:
-					ambiguous = true
-					break
-		if not ambiguous:
-			result[FIRST_KEY + key] = gains[key] / peak
-	return result
+		# Positive seeds let a key enter the fit again after fading out.
+		gains[key] = maxf(minf(gains[key], strongest), 0.15 * correlation[key] + floor)
+	for _iteration in BETA_UPDATES:
+		predicted.fill(floor)
+		for key in KEYS:
+			var bins := indices[key]
+			var shape := columns[key]
+			for i in bins.size():
+				predicted[bins[i]] += gains[key] * shape[i]
+		for bin in range(1, BINS):
+			var inverse_root := 1.0 / sqrt(predicted[bin])
+			denominator_bins[bin] = inverse_root
+			numerator_bins[bin] = spectrum[bin] / predicted[bin] * inverse_root
+		# Fixed-dictionary multiplicative update at beta = 0.5.
+		# The 2/3 exponent is the majorization-minimization step.
+		for key in KEYS:
+			var numerator := 0.0
+			var denominator := 0.0
+			var bins := indices[key]
+			var shape := columns[key]
+			for i in bins.size():
+				numerator += shape[i] * numerator_bins[bins[i]]
+				denominator += shape[i] * denominator_bins[bins[i]]
+			gains[key] = gains[key] * pow(numerator / denominator, 2.0 / 3.0) if denominator > 0.0 else 0.0
+	# Both solvers use the same squared-error fitness check.
+	for key in KEYS:
+		if gains[key] > 0.0:
+			_subtract_column(correlation, key, gains[key])
 
 func _note_fitness(gain: float, residual_match: float, observed_energy: float) -> float:
 	# Removing this unit-length column changes r to r + gain * column.
 	# Measure the error it prevents as a fraction of the observed spectrum.
 	return gain * (gain + 2.0 * residual_match) / observed_energy
-
-func _supports_octave(lower: int, upper: int, minimum_gain: float) -> bool:
-	var lower_shape := template_spectra[lower]
-	var upper_shape := template_spectra[upper]
-	var pair_spectrum := spectrum.duplicate()
-	for other in KEYS:
-		if other == lower or other == upper or gains[other] <= minimum_gain:
-			continue
-		var bins := indices[other]
-		var shape := columns[other]
-		for i in bins.size():
-			pair_spectrum[bins[i]] -= gains[other] * shape[i]
-
-	# Lower odd partials lie between the upper key's harmonics.
-	var lower_dot := 0.0
-	var lower_energy := 0.0
-	for bin in odd_partials[lower]:
-		lower_dot += lower_shape[bin] * pair_spectrum[bin]
-		lower_energy += lower_shape[bin] * lower_shape[bin]
-	if lower_energy < MIN_ODD_TEMPLATE_ENERGY:
-		return true
-	var lower_gain := maxf(lower_dot / lower_energy, 0.0)
-
-	# Check the upper key's odd partials after accounting for the lower
-	# note. Leave a margin for changes in the lower key's overtone balance.
-	var upper_dot := 0.0
-	var upper_energy := 0.0
-	var overtone_dot := 0.0
-	var overtone_energy := 0.0
-	var learned_lower := configured_templates.has(FIRST_KEY + lower)
-	var variation := LEARNED_OCTAVE_VARIATION if learned_lower else GENERIC_OCTAVE_VARIATION
-	var fundamental := tuning * pow(2.0, (FIRST_KEY + upper - 69) / 12.0)
-	for bin in odd_partials[upper]:
-		var shared := lower_gain * lower_shape[bin]
-		var remaining := pair_spectrum[bin] - (1.0 + variation) * shared
-		var contribution := upper_shape[bin] * remaining
-		var energy := upper_shape[bin] * upper_shape[bin]
-		upper_dot += contribution
-		upper_energy += energy
-		if bin * RATE / SIZE > 2.0 * fundamental:
-			overtone_dot += contribution
-			overtone_energy += energy
-	if upper_energy < MIN_ODD_TEMPLATE_ENERGY:
-		return true
-	# A single strong shared peak can dominate the combined score.
-	# Require an upper overtone when the template has usable energy there.
-	if learned_lower and overtone_energy >= MIN_ODD_TEMPLATE_ENERGY:
-		if overtone_dot <= 0.5 * minimum_gain * overtone_energy:
-			return false
-	return upper_dot > minimum_gain * upper_energy
 
 func _subtract_column(residual: PackedFloat32Array, key: int, change: float) -> void:
 	var overlap := gram[key]

@@ -176,9 +176,9 @@ $$
 
 A note needs a fitness of at least 0.04 to appear. This measures the contribution to the fit at the current gains. It is distinct from the strength shown in the UI, which divides a key's gain by the strongest gain in the frame.
 
-### Where the current octave rule comes in
+### How the current detector handles octaves
 
-After fitting the gains, the code checks octave pairs using the odd-harmonic method below. A separate filter handles harmonics **3 through 10** of a lower reported key. The octave check estimates the lower key from its odd harmonics, allows a margin on its predicted contribution, and looks for evidence in the upper key's own odd harmonics. Those upper odd harmonics are shared frequencies for the pair. The margin is 30% for a learned lower key and 10% for a generic one. [Optimization and post-filter code](chord_detector.gd)
+Both solvers fit the full prepared spectrum. The detector then checks the relative gain and fitness of each candidate. A filter for weak candidates that align with harmonics **3 through 10** of a lower reported key also applies. For C4 and C5, the decision comes from the gain and fitness checks. [Optimization and post-filter code](chord_detector.gd)
 
 ## 6. Put your odd/even idea into an explicit detector
 
@@ -227,7 +227,7 @@ looks exactly like a C4+C5 mixture if \(u=h_5w_5\) in the ideal model. The spect
 
 **Time gives us another clue.** Play C4 and let it ring. Then strike C5. If the even regions jump together while the C4 odd regions continue their previous decay, that favors a new C5 strike. If you play the two keys simultaneously, that clue is weaker because all the regions rise together. The current solver starts with the previous gains for speed, but its objective has no model of an independent hammer strike. An analysis of changes between windows would add information the current fit does not explicitly use.
 
-The project now uses NMF to propose candidates and checks octave pairs afterward. It subtracts the fitted contributions of other strong candidates, estimates C4 from its odd regions, then tests the shared residual against C5's odd regions. For a learned lower key, the check also asks for evidence above C5's fundamental when the upper template has usable odd overtones. This prevents a single shared peak from carrying the decision. The margins are prototype settings. A detector that also tracks fresh attacks would have additional evidence for quiet C5 strikes.
+An earlier version used this method after the NMF fit. It subtracted the fitted contributions of other strong candidates, estimated C4 from its odd regions, and tested the shared residual against C5's odd regions. A detector that also tracks fresh attacks would have additional evidence for quiet C5 strikes.
 
 ## 8. Check your understanding
 
