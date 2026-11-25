@@ -1,66 +1,106 @@
 extends RefCounted
 ## Online fixed-dictionary NMF. Each 50 ms spectrum is fitted as W * h,
 ## where W contains measured piano spectra and h contains nonnegative gains.
-const BANK := preload("res://chord/templates.tres")
-const SIZE := 1024
-const BINS := SIZE >> 1
+const BANKS := [
+	preload("res://chord/templates.tres"),
+	preload("res://chord/templates_hamming.tres"),
+	preload("res://chord/templates_blackman.tres"),
+	preload("res://chord/templates_kaiser4.tres"),
+]
+const KAISER_SHAPE := 4.0
+const FRAME_SIZE := 1024
+const FFT_SIZE := FRAME_SIZE * 2
+const BINS := FFT_SIZE >> 1
 const RATE := 20480.0
-const WINDOW_SECONDS := SIZE / RATE
+const WINDOW_SECONDS := FRAME_SIZE / RATE
 const HOP_SECONDS := 0.010
 const KEYS := 88
 const FIRST_KEY := 21
-const MAX_UPDATES := 24
-const MIN_NOTE_FITNESS := 0.04
 const BETA_UPDATES := 12
+const GATE_DB := -55.0
+const OCTAVE_SEMITONES := 12
+const SOFT_OCTAVE_GAIN_RATIO := 0.10
+const SOFT_OCTAVE_CONFIRMATIONS := 3
 
-enum Solver { SQUARED_ERROR, BETA_HALF }
+enum Taper { HANN, HAMMING, BLACKMAN, KAISER_4 }
 
 var permutation := PackedInt32Array()
-var taper := PackedFloat32Array()
+var tapers: Array[PackedFloat32Array] = []
 var roots := PackedVector2Array()
 var fft := PackedVector2Array()
 var spectrum := PackedFloat32Array()
 var bin_weights := PackedFloat32Array()
 var indices: Array[PackedInt32Array] = []
 var columns: Array[PackedFloat32Array] = []
-var gram: Array[PackedFloat32Array] = []
+var measured_columns: Array[PackedFloat32Array] = []
+var predicted := PackedFloat32Array()
+var numerator_bins := PackedFloat32Array()
+var denominator_bins := PackedFloat32Array()
 var gains := PackedFloat32Array()
+var confirmation := preload("res://chord/note_confirmation.gd").new()
+var analysis_ms := 0.0
+var octave_confirmations := PackedInt32Array()
 var tuning := 0.0
 var configured_templates := {}
-var solver := Solver.SQUARED_ERROR
+var window := Taper.HANN
+var beta := 0.5
 
 func _init() -> void:
-	fft.resize(SIZE)
+	fft.resize(FFT_SIZE)
 	spectrum.resize(BINS)
+	predicted.resize(BINS)
+	numerator_bins.resize(BINS)
+	denominator_bins.resize(BINS)
 	gains.resize(KEYS)
-	for i in SIZE:
+	octave_confirmations.resize(KEYS)
+	for _bank in BANKS:
+		tapers.append(PackedFloat32Array())
+	var kaiser_center := _bessel_i0(KAISER_SHAPE)
+	for i in FFT_SIZE:
 		var reversed := 0
 		var bits := i
-		for _bit in 10:
+		var remaining := FFT_SIZE
+		while remaining > 1:
 			reversed = (reversed << 1) | (bits & 1)
 			bits >>= 1
+			remaining >>= 1
 		permutation.append(reversed)
-		taper.append(0.5 - 0.5 * cos(TAU * i / SIZE))
+		if i < FRAME_SIZE:
+			var position := float(i) / FRAME_SIZE
+			var angle := TAU * position
+			var cosine := cos(angle)
+			tapers[Taper.HANN].append(0.5 - 0.5 * cosine)
+			tapers[Taper.HAMMING].append(0.54 - 0.46 * cosine)
+			tapers[Taper.BLACKMAN].append(0.42 - 0.5 * cosine + 0.08 * cos(2.0 * angle))
+			var centered := 2.0 * position - 1.0
+			tapers[Taper.KAISER_4].append(_bessel_i0(KAISER_SHAPE * sqrt(1.0 - centered * centered)) / kaiser_center)
 		if i < BINS:
-			roots.append(Vector2(cos(TAU * i / SIZE), -sin(TAU * i / SIZE)))
-			bin_weights.append(pow(maxf(i, 2), 0.10))
+			roots.append(Vector2(cos(TAU * i / FFT_SIZE), -sin(TAU * i / FFT_SIZE)))
+			bin_weights.append(pow(maxf(i * float(FRAME_SIZE) / FFT_SIZE, 2.0), 0.10))
 
-func configure(a4: float, personal_templates: Dictionary = {}) -> void:
+static func _bessel_i0(x: float) -> float:
+	var sum := 1.0
+	var term := 1.0
+	for order in range(1, 13):
+		var ratio := x / (2.0 * order)
+		term *= ratio * ratio
+		sum += term
+	return sum
+
+func configure(a4: float, personal_templates: Dictionary = {}, analysis_window := Taper.HANN) -> void:
 	reset()
-	if is_equal_approx(a4, tuning) and personal_templates == configured_templates:
+	if is_equal_approx(a4, tuning) and personal_templates == configured_templates and window == analysis_window:
 		return
 	tuning = a4
+	window = analysis_window
 	configured_templates = personal_templates.duplicate()
 	indices.clear()
 	columns.clear()
-	gram.clear()
-	var bank: PackedByteArray = BANK.get_meta("spectra")
-	var template_spectra: Array[PackedFloat32Array] = []
+	measured_columns.clear()
+	var bank: PackedByteArray = BANKS[window].get_meta("spectra")
 	for key in KEYS:
 		var bins := PackedInt32Array()
 		var values := PackedFloat32Array()
-		var column := PackedFloat32Array()
-		column.resize(BINS)
 		var norm := 0.0
 		var personal: PackedFloat32Array = personal_templates.get(FIRST_KEY + key, PackedFloat32Array())
 		var personal_peak := 0.0
@@ -82,31 +122,44 @@ func configure(a4: float, personal_templates: Dictionary = {}) -> void:
 				value = personal[b]
 			if value <= 0.0:
 				continue
-			column[b] = value
 			norm += value * value
 			bins.append(b)
+			values.append(value)
 		norm = sqrt(norm)
-		for b in bins:
-			column[b] /= norm
-			values.append(column[b])
-		template_spectra.append(column)
+		for i in values.size():
+			values[i] /= norm
 		indices.append(bins)
 		columns.append(values)
-	# Precompute W'W. The bounded solver only visits 88 values per update.
-	for key in KEYS:
-		var overlaps := PackedFloat32Array()
-		for other in KEYS:
-			var overlap := 0.0
-			for i in indices[key].size():
-				overlap += columns[key][i] * template_spectra[other][indices[key][i]]
-			overlaps.append(overlap)
-		gram.append(overlaps)
+		var products := PackedFloat32Array()
+		products.resize(bins.size())
+		measured_columns.append(products)
 
 func reset() -> void:
 	gains.fill(0.0)
+	octave_confirmations.fill(0)
+	confirmation.reset()
+	analysis_ms = 0.0
 
-func measure_template(frames: PackedVector2Array) -> PackedFloat32Array:
-	_spectrum(frames)
+static func input_level_db(frames: PackedVector2Array) -> float:
+	var power := 0.0
+	for frame in frames:
+		power += frame.length_squared() * 0.5
+	return linear_to_db(maxf(0.000001, sqrt(power / frames.size())))
+
+func analyze_frame(frames: PackedVector2Array, audio_ms := -1.0) -> Dictionary:
+	var start := Time.get_ticks_usec()
+	var db := input_level_db(frames)
+	var keys := {}
+	if db >= GATE_DB:
+		keys = estimate(frames)
+	else:
+		reset()
+	analysis_ms = audio_ms if audio_ms >= 0.0 else analysis_ms + 1000.0 * HOP_SECONDS
+	var confirmed := confirmation.update(keys, gains, FIRST_KEY, analysis_ms)
+	return {"db": db, "keys": confirmed, "raw_keys": keys, "usec": Time.get_ticks_usec() - start}
+
+func measure_template(frames: PackedVector2Array, analysis_window: Taper) -> PackedFloat32Array:
+	_spectrum(frames, analysis_window)
 	var peak := 0.0
 	for value in spectrum:
 		peak = maxf(peak, value)
@@ -116,22 +169,27 @@ func measure_template(frames: PackedVector2Array) -> PackedFloat32Array:
 			measured.append(value / peak)
 	return measured
 
-func _spectrum(frames: PackedVector2Array) -> void:
-	# Area-average the source window into SIZE mono samples at the analysis rate.
-	var step := float(frames.size()) / SIZE
-	for i in SIZE:
+func _spectrum(frames: PackedVector2Array, analysis_window: Taper) -> void:
+	var taper := tapers[analysis_window]
+	var step := float(frames.size()) / FRAME_SIZE
+	for i in FRAME_SIZE:
 		var begin := i * step
 		var end := (i + 1) * step
 		var sum := 0.0
 		for j in range(floori(begin), mini(ceili(end), frames.size())):
 			var weight := minf(end, j + 1) - maxf(begin, j)
 			sum += (frames[j].x + frames[j].y) * weight
-		fft[permutation[i]] = Vector2(sum * taper[i] / (2.0 * step), 0.0)
-	var width := 2
-	while width <= SIZE:
+		var value := Vector2(sum * taper[i] / (2.0 * step), 0.0)
+		var index := permutation[i]
+		# Bit reversal pairs each sample with a padding zero. The first
+		# butterfly maps (sample, 0) to (sample, sample).
+		fft[index] = value
+		fft[index + 1] = value
+	var width := 4
+	while width <= FFT_SIZE:
 		var half := width >> 1
-		var root_step := SIZE / width
-		for block in range(0, SIZE, width):
+		var root_step := FFT_SIZE / width
+		for block in range(0, FFT_SIZE, width):
 			for j in half:
 				var index := block + j
 				var a := fft[index]
@@ -150,7 +208,7 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 	if frames.is_empty() or columns.is_empty():
 		reset()
 		return {}
-	_spectrum(frames)
+	_spectrum(frames, window)
 	var correlation := PackedFloat32Array()
 	var strongest := 0.0
 	var power := 0.0
@@ -168,19 +226,23 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 		reset()
 		return {}
 
-	if solver == Solver.BETA_HALF:
-		_fit_beta_half(correlation, strongest)
-	else:
-		_fit_squared_error(correlation, strongest)
+	_fit_beta(correlation, strongest)
 	var peak := 0.0
 	for gain in gains:
 		peak = maxf(peak, gain)
 	var minimum_gain := 0.21 * peak
 	var result := {}
 	for key in KEYS:
-		if gains[key] <= minimum_gain:
-			continue
-		if _note_fitness(gains[key], correlation[key], power) < MIN_NOTE_FITNESS:
+		var octave_lower := key - OCTAVE_SEMITONES
+		# A weak octave can have too little gain for either immediate gate.
+		# Anchor the exception to the strongest detected key to protect chords
+		# whose quieter notes can leave weak residuals at several octaves.
+		if octave_lower >= 0 and gains[octave_lower] == peak and result.has(FIRST_KEY + octave_lower) and gains[key] >= SOFT_OCTAVE_GAIN_RATIO * peak:
+			octave_confirmations[key] = mini(octave_confirmations[key] + 1, SOFT_OCTAVE_CONFIRMATIONS)
+		else:
+			octave_confirmations[key] = 0
+		var confirmed_octave := octave_confirmations[key] >= SOFT_OCTAVE_CONFIRMATIONS
+		if gains[key] <= minimum_gain and not confirmed_octave:
 			continue
 		# With a different piano, one strong upper partial can remain after
 		# fitting its key. Require stronger evidence at overlapping partials.
@@ -188,77 +250,47 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 		for lower: int in result:
 			var ratio := pow(2.0, (FIRST_KEY + key - lower) / 12.0)
 			var partial := roundi(ratio)
-			if partial >= 3 and partial <= 10 and absf(ratio - partial) < 0.012 * partial:
+			if partial >= 2 and partial <= 10 and absf(ratio - partial) < 0.012 * partial:
 				if gains[key] < 0.38 * gains[lower - FIRST_KEY]:
+					if confirmed_octave and lower == FIRST_KEY + octave_lower:
+						continue
 					ambiguous = true
 					break
 		if not ambiguous:
 			result[FIRST_KEY + key] = gains[key] / peak
 	return result
 
-func _fit_squared_error(correlation: PackedFloat32Array, strongest: float) -> void:
-	# Coordinate descent on 0.5 * ||W*h - spectrum||² + penalty * sum(h).
-	var penalty := 0.10 * strongest
-	for key in KEYS:
-		if gains[key] > 0:
-			_subtract_column(correlation, key, gains[key])
-	for _iteration in MAX_UPDATES:
-		var best := -1
-		var change := 0.0
-		for key in KEYS:
-			var delta := maxf(-gains[key], correlation[key] - penalty)
-			if absf(delta) > absf(change):
-				best = key
-				change = delta
-		if absf(change) < 0.003 * strongest:
-			break
-		gains[best] = maxf(0.0, gains[best] + change)
-		_subtract_column(correlation, best, change)
-
-func _fit_beta_half(correlation: PackedFloat32Array, strongest: float) -> void:
-	var predicted := PackedFloat32Array()
-	var numerator_bins := PackedFloat32Array()
-	var denominator_bins := PackedFloat32Array()
-	predicted.resize(BINS)
-	numerator_bins.resize(BINS)
-	denominator_bins.resize(BINS)
+func _fit_beta(correlation: PackedFloat32Array, strongest: float) -> void:
 	var floor := 0.001 * strongest
+	# Itakura–Saito divergence at beta = 0 requires positive observations.
+	var observation_floor := 0.000001 * strongest if is_zero_approx(beta) else 0.0
 	for key in KEYS:
 		# Positive seeds let a key enter the fit again after fading out.
 		gains[key] = maxf(minf(gains[key], strongest), 0.15 * correlation[key] + floor)
+		var bins := indices[key]
+		var shape := columns[key]
+		for i in bins.size():
+			# Equation 12 folds the observed spectrum into W once per frame.
+			measured_columns[key][i] = shape[i] * maxf(spectrum[bins[i]], observation_floor)
 	for _iteration in BETA_UPDATES:
 		predicted.fill(floor)
 		for key in KEYS:
 			var bins := indices[key]
 			var shape := columns[key]
+			var gain := gains[key]
 			for i in bins.size():
-				predicted[bins[i]] += gains[key] * shape[i]
+				predicted[bins[i]] += gain * shape[i]
 		for bin in range(1, BINS):
-			var inverse_root := 1.0 / sqrt(predicted[bin])
-			denominator_bins[bin] = inverse_root
-			numerator_bins[bin] = spectrum[bin] / predicted[bin] * inverse_root
-		# Fixed-dictionary multiplicative update at beta = 0.5.
-		# The 2/3 exponent is the majorization-minimization step.
+			denominator_bins[bin] = pow(predicted[bin], beta - 1.0)
+			numerator_bins[bin] = denominator_bins[bin] / predicted[bin]
 		for key in KEYS:
 			var numerator := 0.0
 			var denominator := 0.0
 			var bins := indices[key]
 			var shape := columns[key]
+			var products := measured_columns[key]
 			for i in bins.size():
-				numerator += shape[i] * numerator_bins[bins[i]]
-				denominator += shape[i] * denominator_bins[bins[i]]
-			gains[key] = gains[key] * pow(numerator / denominator, 2.0 / 3.0) if denominator > 0.0 else 0.0
-	# Both solvers use the same squared-error fitness check.
-	for key in KEYS:
-		if gains[key] > 0.0:
-			_subtract_column(correlation, key, gains[key])
-
-func _note_fitness(gain: float, residual_match: float, observed_energy: float) -> float:
-	# Removing this unit-length column changes r to r + gain * column.
-	# Measure the error it prevents as a fraction of the observed spectrum.
-	return gain * (gain + 2.0 * residual_match) / observed_energy
-
-func _subtract_column(residual: PackedFloat32Array, key: int, change: float) -> void:
-	var overlap := gram[key]
-	for other in KEYS:
-		residual[other] -= change * overlap[other]
+				var bin := bins[i]
+				numerator += products[i] * numerator_bins[bin]
+				denominator += shape[i] * denominator_bins[bin]
+			gains[key] = gains[key] * numerator / denominator if denominator > 0.0 else 0.0

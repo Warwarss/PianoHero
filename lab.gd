@@ -2,7 +2,10 @@ extends Control
 
 const Detector := preload("res://pitch_detector.gd")
 const ChordDetector := preload("res://chord/chord_detector.gd")
+const LiveChordWorker := preload("res://chord/live_chord_worker.gd")
 const ChordReplay := preload("res://chord/chord_replay.gd")
+const GuidedChordTest := preload("res://chord/guided_chord_test.gd")
+const KeyCalibration := preload("res://chord/key_calibration.gd")
 const NAMES := ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
 const ANDROID_MIC := "android.permission.RECORD_AUDIO"
 const GATE_DB := -55.0
@@ -15,11 +18,8 @@ const MAX_SPREAD_CENTS := 18.0
 const TUNING_FILE := "user://piano_tuning.cfg"
 const PLAY_A4 := "Play and hold A4, the A above middle C."
 const PROFILE_FILE := "user://piano_templates.cfg"
-const QUIET_HOPS := 12
-const TEMPLATE_HOPS := 25
-const ATTACK_HOPS := 5
-const MIN_TEMPLATE_HOPS := 12
-const LEARNING_GATE_DB := -45.0
+const TEMPLATE_SECTIONS := ["hann", "hamming", "blackman", "kaiser4"]
+const WINDOW_LABELS := ["Hann", "Hamming", "Blackman", "Kaiser (shape 4)"]
 
 @onready var note: Label = %Note
 @onready var detail: Label = %Detail
@@ -31,7 +31,10 @@ const LEARNING_GATE_DB := -45.0
 @onready var tuning_label: Label = %Tuning
 @onready var mode: OptionButton = %Mode
 @onready var replay_button: Button = %Replay
-@onready var solver_choice: OptionButton = %Solver
+@onready var beta_slider: HSlider = %Beta
+@onready var analysis_window: OptionButton = %AnalysisWindow
+@onready var guided_button: Button = %GuidedTest
+@onready var guided_record: Button = %GuidedRecord
 @onready var profile: CheckButton = %Profile
 @onready var learn_key: OptionButton = %LearnKey
 @onready var learn: Button = %Learn
@@ -40,6 +43,7 @@ const LEARNING_GATE_DB := -45.0
 var detector := Detector.new()
 var capture := AudioEffectCapture.new()
 var recent := PackedVector2Array()
+var take_capture_start := 0
 var sample_rate: float
 var window_frames: int
 var hop_frames: int
@@ -52,16 +56,25 @@ var reference_hz := STANDARD_A4
 var pitches: Array[float] = []
 var stable_seconds := 0.0
 var chord_detector := ChordDetector.new()
+var live_chord_worker := LiveChordWorker.new()
+var live_worker_started := false
+var live_worker_failed := false
+var chord_audio_ms := 0.0
+var live_discarded := 0
 var replay: ChordReplay
+var guided_test: GuidedChordTest
+var guided_pending := false
+var guided_started_mic := false
+var guided_discarded := 0
+var guided_capture_start := 0
 var replay_time := 0.0
 var skipped_hops := 0
 var discarded_at_start := 0
-var personal_templates := {}
+var piano_templates: Array[Dictionary] = []
 var learning_key := 0
 var learning_all := false
-var quiet_hops := 0
-var template_hops := 0
-var template_sum := PackedFloat32Array()
+var key_calibration: KeyCalibration
+var calibration_saved := 0
 var learn_deadline := 0
 
 func _ready() -> void:
@@ -77,10 +90,18 @@ func _ready() -> void:
 	mode.add_item("Chord mode")
 	mode.item_selected.connect(_mode_changed)
 	replay_button.pressed.connect(_toggle_replay)
-	solver_choice.add_item("Solver · Squared error", ChordDetector.Solver.SQUARED_ERROR)
-	solver_choice.add_item("Solver · β-divergence (0.5)", ChordDetector.Solver.BETA_HALF)
-	solver_choice.item_selected.connect(_solver_changed)
+	%AttackDecay.record_requested.connect(_record_attack_decay)
+	guided_button.pressed.connect(_toggle_guided_test)
+	guided_record.pressed.connect(_record_guided_trial)
+	beta_slider.value_changed.connect(_beta_changed)
+	%AttackTime.value_changed.connect(_confirmation_changed)
+	%SpectrumTime.value_changed.connect(_confirmation_changed)
+	for window_index in WINDOW_LABELS.size():
+		analysis_window.add_item("Live window · %s" % WINDOW_LABELS[window_index], window_index)
+		piano_templates.append({})
+	analysis_window.item_selected.connect(_window_changed)
 	learn.pressed.connect(_toggle_learning)
+	%RetryKey.pressed.connect(func(): _retry_key("Retrying · Release the key and pedal"))
 	profile.toggled.connect(_profile_changed)
 	learn_key.add_item("All keys (A0–C8)", 0)
 	for key in range(ChordDetector.FIRST_KEY, ChordDetector.FIRST_KEY + ChordDetector.KEYS):
@@ -97,8 +118,11 @@ func _ready() -> void:
 
 func _mode_changed(_index: int) -> void:
 	var chords := mode.selected == 1
+	%LiveHeading.visible = chords
+	%AttackDecay.visible = chords
+	%AttackDecay.cancel_take("Take canceled when switching modes.")
 	replay_button.visible = chords
-	solver_choice.visible = chords
+	%ChordSettings.visible = chords
 	profile.visible = chords
 	%LearningControls.visible = chords
 	%Hint.text = "Play piano notes together, from A0 to C8." if chords else "Play one note at a time, from C3 to C6."
@@ -109,51 +133,102 @@ func _mode_changed(_index: int) -> void:
 	status.text = "Listening" if listening else "Ready to listen"
 	_reset_analysis()
 
-func _solver_changed(index: int) -> void:
-	chord_detector.solver = solver_choice.get_item_id(index) as ChordDetector.Solver
+func _beta_changed(value: float) -> void:
+	chord_detector.beta = value
+	%BetaLabel.text = "Live β divergence · %.2f" % value
 	chord_detector.reset()
+	_configure_live_worker()
+
+func _window_changed(_index: int) -> void:
+	_update_profile_label()
+	_reset_analysis()
+
+func _confirmation_changed(_value: float) -> void:
+	chord_detector.confirmation.attack_ms = %AttackTime.value
+	chord_detector.confirmation.spectral_ms = %SpectrumTime.value
+	%AttackDecay.attack_ms = %AttackTime.value
+	%AttackDecay.spectral_ms = %SpectrumTime.value
+	_reset_analysis()
+
+func _set_confirmation_controls(enabled: bool) -> void:
+	%AttackTime.editable = enabled
+	%SpectrumTime.editable = enabled
 
 func _reset_analysis() -> void:
+	%AttackDecay.cancel_take("Capture settings changed. Start again for accurate timing.")
 	sample_rate = AudioServer.get_mix_rate()
 	var chords := mode.selected == 1 and not calibrating
 	window_frames = roundi(sample_rate * (ChordDetector.WINDOW_SECONDS if chords else Detector.WINDOW_SECONDS))
 	hop_frames = roundi(sample_rate * (ChordDetector.HOP_SECONDS if chords else 0.015))
 	if chords and learning_key == 0:
-		chord_detector.configure(reference_hz, personal_templates if profile.button_pressed else {})
+		var templates := piano_templates[analysis_window.selected] if profile.button_pressed else {}
+		chord_detector.configure(reference_hz, templates, analysis_window.selected as ChordDetector.Taper)
+		_configure_live_worker()
+	else:
+		live_chord_worker.clear()
 	recent.clear()
 	fresh_frames = 0
+	chord_audio_ms = 0.0
 	skipped_hops = 0
 	discarded_at_start = capture.get_discarded_frames()
+	live_discarded = discarded_at_start
 	capture.clear_buffer()
+
+func _configure_live_worker() -> void:
+	var templates := piano_templates[analysis_window.selected] if profile.button_pressed else {}
+	live_chord_worker.configure(reference_hz, templates, analysis_window.selected as ChordDetector.Taper, chord_detector.beta,
+			chord_detector.confirmation.attack_ms, chord_detector.confirmation.spectral_ms)
 
 func _note_name(key: int) -> String:
 	return "%s%d" % [NAMES[key % 12], floori(key / 12.0) - 1]
 
 func _load_templates() -> void:
 	var config := ConfigFile.new()
-	if config.load(PROFILE_FILE) == OK and config.has_section("keys"):
-		for label in config.get_section_keys("keys"):
-			var key := label.to_int()
-			var values = config.get_value("keys", label)
-			if learn_key.get_item_index(key) > 0 and values is PackedFloat32Array and values.size() == ChordDetector.BINS:
-				personal_templates[key] = values
+	if config.load(PROFILE_FILE) == OK:
+		if config.has_section("keys"):
+			for label in config.get_section_keys("keys"):
+				var key := label.to_int()
+				var values = config.get_value("keys", label)
+				if learn_key.get_item_index(key) > 0 and values is PackedFloat32Array and values.size() == ChordDetector.BINS / 2:
+					var interpolated := PackedFloat32Array()
+					interpolated.resize(ChordDetector.BINS)
+					for bin in ChordDetector.BINS:
+						var left := bin >> 1
+						interpolated[bin] = values[left]
+						if bin % 2 == 1 and left + 1 < values.size():
+							interpolated[bin] = 0.5 * (values[left] + values[left + 1])
+					piano_templates[ChordDetector.Taper.HANN][key] = interpolated
+		for window_index in TEMPLATE_SECTIONS.size():
+			var section: String = TEMPLATE_SECTIONS[window_index]
+			if not config.has_section(section):
+				continue
+			for label in config.get_section_keys(section):
+				var key := label.to_int()
+				var values = config.get_value(section, label)
+				if learn_key.get_item_index(key) > 0 and values is PackedFloat32Array and values.size() == ChordDetector.BINS:
+					piano_templates[window_index][key] = values
 	_update_profile_label()
 
 func _update_profile_label() -> void:
-	profile.text = "Use my piano templates (%d/88)" % personal_templates.size()
-	for key: int in personal_templates:
-		learn_key.set_item_text(learn_key.get_item_index(key), "%s ✓" % _note_name(key))
+	var templates := piano_templates[analysis_window.selected]
+	profile.text = "Use my piano templates (%d/88)" % templates.size()
+	for index in range(1, learn_key.item_count):
+		var key := learn_key.get_item_id(index)
+		learn_key.set_item_text(index, _note_name(key) + (" ✓" if templates.has(key) else ""))
 
 func _profile_changed(_enabled: bool) -> void:
 	if listening:
 		_reset_analysis()
 
 func _toggle_learning() -> void:
+	%AttackDecay.cancel_take("Take canceled when starting template learning.")
 	if learning_key != 0:
 		_end_learning()
 		status.text = "Learning stopped · Recorded keys kept"
 		return
 	learning_all = learn_key.get_selected_id() == 0
+	%AttackDecay.cancel_training()
+	calibration_saved = 0
 	var key := ChordDetector.FIRST_KEY if learning_all else learn_key.get_selected_id()
 	_begin_key(key)
 	_set_learning_controls(true)
@@ -162,12 +237,10 @@ func _toggle_learning() -> void:
 	else:
 		_toggle_capture()
 
-func _begin_key(key: int) -> void:
+func _begin_key(key: int, wait_for_release := false) -> void:
 	learning_key = key
-	quiet_hops = 0
-	template_hops = 0
-	template_sum.resize(ChordDetector.BINS)
-	template_sum.fill(0.0)
+	key_calibration = KeyCalibration.new(roundi(AudioServer.get_mix_rate()), wait_for_release)
+	discarded_at_start = capture.get_discarded_frames()
 	learn_deadline = Time.get_ticks_msec() + 25000
 	note.text = _note_name(key)
 	detail.text = "Release the keys and pedal"
@@ -177,64 +250,100 @@ func _set_learning_controls(active: bool) -> void:
 	mode.disabled = active
 	calibrate.disabled = active
 	replay_button.disabled = active
+	analysis_window.disabled = active
+	guided_button.disabled = active
 	profile.disabled = active
 	learn_key.disabled = active
-	learn.text = "Stop learning" if active else "Learn"
+	_set_confirmation_controls(not active)
+	learn.text = "Finish calibration" if active else "Calibrate keys"
+	%RetryKey.visible = active
+
+func _retry_key(message: String) -> void:
+	if learning_key == 0:
+		return
+	var deadline := learn_deadline
+	_begin_key(learning_key, true)
+	learn_deadline = deadline
+	status.text = message
 
 func _end_learning() -> void:
 	learning_key = 0
+	key_calibration = null
 	learning_all = false
 	_set_learning_controls(false)
 	if listening:
 		_reset_analysis()
+	if calibration_saved > 0:
+		%AttackDecay.train_calibration()
+		calibration_saved = 0
 
-func _learn_from_frame(frames: PackedVector2Array, db: float) -> void:
-	level.value = db
-	if quiet_hops < QUIET_HOPS:
-		quiet_hops = quiet_hops + 1 if db < LEARNING_GATE_DB else 0
-		if quiet_hops == QUIET_HOPS:
-			detail.text = "Play %s once and hold it" % _note_name(learning_key)
+func _learn_from_audio(frames: PackedVector2Array) -> void:
+	if capture.get_discarded_frames() != discarded_at_start:
+		_retry_key("Audio dropped · Release the key and wait for the next prompt")
 		return
-	if db < LEARNING_GATE_DB:
-		if template_hops >= MIN_TEMPLATE_HOPS:
-			_save_learned_key()
-		elif template_hops > 0:
-			_begin_key(learning_key)
+	key_calibration.append(frames)
+	level.value = key_calibration.db
+	if key_calibration.rejected:
+		_retry_key("Strike was too brief · Release the key and try again at the prompt")
 		return
-	var measured := chord_detector.measure_template(frames)
-	if measured.is_empty():
-		return
-	# Leave the first 50 ms for the attack, then average the next windows.
-	if template_hops >= ATTACK_HOPS:
-		for bin in measured.size():
-			template_sum[bin] += measured[bin]
-	template_hops += 1
-	detail.text = "Hold %s · %d%%" % [_note_name(learning_key), 4 * template_hops]
-	if template_hops == TEMPLATE_HOPS:
+	if key_calibration.onset >= 0:
+		detail.text = "Hold %s" % _note_name(learning_key)
+	elif key_calibration.armed:
+		detail.text = "Play %s once and hold it" % _note_name(learning_key)
+	if key_calibration.complete:
 		_save_learned_key()
 
 func _save_learned_key() -> void:
 	var key := learning_key
-	for bin in template_sum.size():
-		template_sum[bin] /= template_hops - ATTACK_HOPS
-	personal_templates[key] = template_sum.duplicate()
+	var rate := key_calibration.rate
+	var size := roundi(rate * ChordDetector.WINDOW_SECONDS)
+	var windows: Array[PackedVector2Array] = []
+	for offset in [0.05, 0.10, 0.15, 0.20]:
+		var first := key_calibration.onset + roundi(rate * float(offset))
+		windows.append(key_calibration.audio.slice(first, first + size))
+	for window_index in TEMPLATE_SECTIONS.size():
+		var total := PackedFloat32Array()
+		total.resize(ChordDetector.BINS)
+		var count := 0
+		for frames in windows:
+			var measured := chord_detector.measure_template(frames, window_index as ChordDetector.Taper)
+			if not measured.is_empty():
+				for bin in measured.size():
+					total[bin] += measured[bin]
+				count += 1
+		if count > 0:
+			for bin in total.size():
+				total[bin] /= count
+			piano_templates[window_index][key] = total
+	var audio_saved := key_calibration.save_note(key) == OK
+	if audio_saved:
+		calibration_saved += 1
 	var config := ConfigFile.new()
-	for learned: int in personal_templates:
-		config.set_value("keys", str(learned), personal_templates[learned])
+	for window_index in TEMPLATE_SECTIONS.size():
+		var templates := piano_templates[window_index]
+		for learned: int in templates:
+			config.set_value(TEMPLATE_SECTIONS[window_index], str(learned), templates[learned])
 	var saved := config.save(PROFILE_FILE) == OK
 	_update_profile_label()
 	profile.set_pressed_no_signal(true)
-	if saved and learning_all and key < ChordDetector.FIRST_KEY + ChordDetector.KEYS - 1:
-		_begin_key(key + 1)
+	if saved and audio_saved and learning_all and key < ChordDetector.FIRST_KEY + ChordDetector.KEYS - 1:
+		_begin_key(key + 1, true)
 		return
 	_end_learning()
-	status.text = "%s saved" % _note_name(key) if saved else "Templates available for this session · Save failed"
+	if not audio_saved:
+		status.text = "Could not save the strike recording."
+	elif not saved:
+		status.text = "Strike saved · Live templates could not be saved."
+	else:
+		status.text = "%s calibration saved" % _note_name(key)
+		detail.text = "Release the key"
 
 func _show_reference() -> void:
 	var cents := 1200.0 * log(reference_hz / STANDARD_A4) / log(2.0)
 	tuning_label.text = "Reference A4   %.1f Hz   ·   %+.0f cents" % [reference_hz, cents]
 
 func _toggle_calibration() -> void:
+	%AttackDecay.cancel_take("Take canceled when starting A4 calibration.")
 	if calibrating:
 		_end_calibration()
 		status.text = "Calibration canceled"
@@ -242,6 +351,7 @@ func _toggle_calibration() -> void:
 	calibrating = true
 	mode.disabled = true
 	replay_button.disabled = true
+	guided_button.disabled = true
 	learn.disabled = true
 	profile.disabled = true
 	calibrate.text = "Cancel"
@@ -258,6 +368,7 @@ func _end_calibration() -> void:
 	stable_seconds = 0.0
 	mode.disabled = false
 	replay_button.disabled = false
+	guided_button.disabled = false
 	learn.disabled = false
 	profile.disabled = false
 	if listening:
@@ -291,6 +402,7 @@ func _permission_result(permission: String, granted: bool) -> void:
 	if granted:
 		_start()
 	else:
+		guided_pending = false
 		_end_calibration()
 		if learning_key != 0:
 			_end_learning()
@@ -305,10 +417,14 @@ func _start() -> void:
 	else:
 		status.text = PLAY_A4 if calibrating else "Listening"
 	toggle.text = "Stop microphone"
+	if guided_pending:
+		_begin_guided_test()
 
 func _stop() -> void:
+	%AttackDecay.finish_take()
 	player.stop()
 	listening = false
+	live_chord_worker.clear()
 	_end_calibration()
 	if learning_key != 0:
 		_end_learning()
@@ -318,13 +434,20 @@ func _stop() -> void:
 	metrics.text = ""
 	status.text = "Microphone stopped"
 	toggle.text = "Start microphone"
+	if guided_test != null:
+		_finish_guided_test()
 
 func _process(delta: float) -> void:
+	%AttackDecay.set_input_available(replay == null and not calibrating and learning_key == 0 and guided_test == null and not waiting_permission)
 	if replay != null:
 		_advance_replay(delta)
 		return
 	if not listening:
 		return
+	if mode.selected == 1 and not calibrating and learning_key == 0 and guided_test == null and live_worker_started:
+		var result := live_chord_worker.take_latest()
+		if not result.is_empty():
+			_show_chord_result(result.keys, result.db, result.usec)
 	if learning_key != 0 and Time.get_ticks_msec() >= learn_deadline:
 		_end_learning()
 		status.text = "Learning timed out · Recorded keys kept"
@@ -332,9 +455,36 @@ func _process(delta: float) -> void:
 	var count := capture.get_frames_available()
 	if count == 0:
 		return
-	recent.append_array(capture.get_buffer(count))
+	var captured := capture.get_buffer(count)
+	if learning_key != 0:
+		_learn_from_audio(captured)
+		return
+	if %AttackDecay.recording or %AttackDecay.following:
+		if capture.get_discarded_frames() != take_capture_start:
+			%AttackDecay.cancel_take("Audio was dropped. Record another take for accurate strike times.")
+		else:
+			%AttackDecay.add_samples(captured)
+	if guided_test != null and not guided_test.recording():
+		return
+	if guided_test == null and mode.selected == 1 and not calibrating:
+		var discarded := capture.get_discarded_frames()
+		if discarded != live_discarded:
+			live_discarded = discarded
+			recent.clear()
+			chord_detector.reset()
+			live_chord_worker.clear()
+	recent.append_array(captured)
+	if guided_test != null:
+		guided_test.samples.append_array(captured)
 	if mode.selected == 1 and not calibrating:
 		_process_chords()
+		if guided_test != null and guided_test.advance_prompt():
+			if not guided_test.recording():
+				guided_discarded += capture.get_discarded_frames() - guided_capture_start
+			if guided_test.finished():
+				_finish_guided_test()
+			else:
+				_update_guided_prompt()
 		return
 	fresh_frames += count
 	if recent.size() < window_frames or fresh_frames < hop_frames:
@@ -370,40 +520,54 @@ func _process_chords() -> void:
 	if recent.size() < window_frames:
 		return
 	var hops := 1 + floori(float(recent.size() - window_frames) / hop_frames)
-	# Bound catch-up work after a stalled frame and surface the lost hops.
+	if guided_test == null:
+		var latest_offset := (hops - 1) * hop_frames
+		var frames := recent.slice(latest_offset, latest_offset + window_frames)
+		recent = recent.slice(latest_offset + hop_frames)
+		chord_audio_ms += 1000.0 * hops * hop_frames / sample_rate
+		if not live_worker_started and not live_worker_failed:
+			var error := live_chord_worker.start()
+			live_worker_started = error == OK
+			live_worker_failed = not live_worker_started
+			if live_worker_failed:
+				push_warning("Could not start chord analysis thread: %s" % error_string(error))
+		if live_worker_started:
+			live_chord_worker.submit(frames, chord_audio_ms)
+		else:
+			_analyze_chord(frames, true, -1, chord_audio_ms)
+		return
+
+	# Guided tests keep a bounded backlog.
 	var skipped := maxi(0, hops - 4)
 	var offset := skipped * hop_frames
-	skipped_hops += skipped
 	if skipped > 0:
+		skipped_hops += skipped
 		chord_detector.reset()
 	for h in range(skipped, hops):
-		_analyze_chord(recent.slice(offset, offset + window_frames), h == hops - 1)
+		var end_sample := -1
+		if guided_test != null:
+			end_sample = guided_test.samples.size() - recent.size() + offset + window_frames
+		_analyze_chord(recent.slice(offset, offset + window_frames), h == hops - 1, end_sample, 1000.0 * end_sample / sample_rate)
 		if recent.is_empty():
 			return
 		offset += hop_frames
 	recent = recent.slice(offset)
 
-func _analyze_chord(frames: PackedVector2Array, display: bool) -> void:
-	var start := Time.get_ticks_usec()
-	var power := 0.0
-	for frame in frames:
-		power += frame.length_squared() * 0.5
-	var db := linear_to_db(maxf(0.000001, sqrt(power / frames.size())))
-	if learning_key != 0:
-		_learn_from_frame(frames, db)
-		return
-	var keys := {}
-	if db >= GATE_DB:
-		keys = chord_detector.estimate(frames)
-	else:
-		chord_detector.reset()
-	var usec := Time.get_ticks_usec() - start
+func _analyze_chord(frames: PackedVector2Array, display: bool, end_sample := -1, audio_ms := -1.0) -> void:
+	var result := chord_detector.analyze_frame(frames, audio_ms)
+	var db: float = result.db
+	var keys: Dictionary = result.keys
+	var usec: int = result.usec
+	if end_sample >= 0:
+		guided_test.record_frame(end_sample, db, usec, chord_detector.gains, keys, result.raw_keys)
 	if replay != null:
 		if display:
 			status.text = "Expected · %s" % ChordReplay.CASES[floori(replay.cursor_ms / 1000.0)][0]
 		replay.score(keys.keys(), usec)
-	if not display:
-		return
+	if display:
+		_show_chord_result(keys, db, usec)
+
+func _show_chord_result(keys: Dictionary, db: float, usec: int) -> void:
 	level.value = db
 	var names := PackedStringArray()
 	var strengths := PackedStringArray()
@@ -420,22 +584,113 @@ func _analyze_chord(frames: PackedVector2Array, display: bool) -> void:
 		if skipped_hops > 0 or discarded > 0:
 			status.text = "Skipped %d hops · %d capture frames lost" % [skipped_hops, discarded]
 
+func _toggle_guided_test() -> void:
+	%AttackDecay.cancel_take("Take canceled when starting the guided test.")
+	if guided_test != null:
+		_finish_guided_test()
+	elif listening:
+		guided_started_mic = false
+		_reset_analysis()
+		_begin_guided_test()
+	else:
+		guided_started_mic = true
+		guided_pending = true
+		guided_button.disabled = true
+		_toggle_capture()
+
+func _begin_guided_test() -> void:
+	guided_pending = false
+	var templates := piano_templates[analysis_window.selected] if profile.button_pressed else {}
+	guided_test = GuidedChordTest.new(roundi(sample_rate), {
+		"beta": chord_detector.beta,
+		"window": TEMPLATE_SECTIONS[analysis_window.selected],
+		"a4_hz": reference_hz,
+		"personal_templates": templates,
+		"first_midi_key": ChordDetector.FIRST_KEY,
+		"window_samples": window_frames,
+		"hop_samples": hop_frames,
+		"fft_size": ChordDetector.FFT_SIZE,
+		"attack_confirmation_ms": chord_detector.confirmation.attack_ms,
+		"spectral_confirmation_ms": chord_detector.confirmation.spectral_ms
+	})
+	guided_discarded = 0
+	_set_guided_controls(true)
+	guided_button.text = "Stop and save test"
+	guided_record.show()
+	_update_guided_prompt()
+	%GuidedPrompt.show()
+
+func _record_guided_trial() -> void:
+	if guided_test == null or guided_test.recording():
+		return
+	recent.clear()
+	capture.clear_buffer()
+	guided_capture_start = capture.get_discarded_frames()
+	chord_detector.reset()
+	guided_test.start_trial()
+	_update_guided_prompt()
+
+func _update_guided_prompt() -> void:
+	%GuidedPrompt.text = guided_test.prompt_text()
+	guided_record.disabled = guided_test.recording()
+	guided_record.text = "Recording…" if guided_test.recording() else "Record"
+
+func _set_guided_controls(active: bool) -> void:
+	mode.disabled = active
+	replay_button.disabled = active
+	toggle.disabled = active
+	calibrate.disabled = active
+	profile.disabled = active
+	learn_key.disabled = active
+	learn.disabled = active
+	beta_slider.editable = not active
+	_set_confirmation_controls(not active)
+	analysis_window.disabled = active
+	guided_button.disabled = false
+
+func _finish_guided_test() -> void:
+	var test := guided_test
+	guided_test = null
+	if test.recording():
+		guided_discarded += capture.get_discarded_frames() - guided_capture_start
+	var recorded_skips := skipped_hops
+	_set_guided_controls(false)
+	guided_record.hide()
+	if guided_started_mic and listening:
+		_stop()
+	elif listening:
+		_reset_analysis()
+	guided_button.text = "Guided microphone test"
+	if test.samples.is_empty():
+		%GuidedPrompt.text = "Test ended before any audio was recorded."
+		return
+	var error := test.save(guided_discarded, recorded_skips)
+	if error == OK:
+		%GuidedPrompt.text = "Test saved · %s (.wav and .json)" % test.output_path
+	else:
+		%GuidedPrompt.text = "Could not save the test · %s" % error_string(error)
+
 func _toggle_replay() -> void:
 	if replay != null:
 		_end_replay()
 		return
+	%AttackDecay.cancel_take("Take canceled when starting the replay.")
 	if listening:
 		_stop()
 	replay = ChordReplay.new()
+	%AttackDecay.analyze_replay(replay.samples, ChordReplay.AUDIO.mix_rate)
 	replay_time = ChordReplay.WINDOW_MS / 1000.0
-	chord_detector.configure(STANDARD_A4)
+	chord_detector.configure(STANDARD_A4, {}, analysis_window.selected as ChordDetector.Taper)
 	tuning_label.text = "Replay reference A4   440 Hz"
 	mode.disabled = true
 	toggle.disabled = true
 	calibrate.disabled = true
 	learn.disabled = true
 	profile.disabled = true
-	solver_choice.disabled = true
+	beta_slider.editable = false
+	_set_confirmation_controls(false)
+	analysis_window.disabled = true
+	guided_button.disabled = true
 	replay_button.text = "Stop replay"
 
 func _advance_replay(delta: float) -> void:
@@ -444,23 +699,35 @@ func _advance_replay(delta: float) -> void:
 		if replay.finished():
 			var report := replay.report()
 			_end_replay()
-			var solver_name := solver_choice.get_item_text(solver_choice.selected)
-			%Results.dialog_text = solver_name + "\n3 consecutive exact updates · % exact\n\n" + report
+			%Results.dialog_text = "β %.2f · %s\n3 consecutive exact updates · %% exact\n\n%s" % [chord_detector.beta, analysis_window.text, report]
 			%Results.popup_centered()
 			return
 		if replay.cursor_ms > replay_time * 1000:
 			return
-		_analyze_chord(replay.next_window(), true)
+		_analyze_chord(replay.next_window(), true, -1, float(replay.cursor_ms))
 
 func _end_replay() -> void:
 	replay = null
 	mode.disabled = false
 	toggle.disabled = false
 	calibrate.disabled = false
-	solver_choice.disabled = false
+	beta_slider.editable = true
+	_set_confirmation_controls(true)
+	analysis_window.disabled = false
 	replay_button.text = "Replay test"
 	_stop()
 	_show_reference()
+
+func _record_attack_decay(follow: bool) -> void:
+	if replay != null or calibrating or learning_key != 0 or guided_test != null:
+		return
+	if not listening:
+		_toggle_capture()
+	if listening:
+		capture.clear_buffer()
+		recent.clear()
+		take_capture_start = capture.get_discarded_frames()
+		%AttackDecay.start_take(roundi(sample_rate), follow)
 
 func _sample_calibration(hz: float, elapsed: float) -> void:
 	note.text = "A4"
@@ -499,5 +766,6 @@ func _notification(what: int) -> void:
 		_stop()
 
 func _exit_tree() -> void:
+	live_chord_worker.shutdown()
 	if bus > 0:
 		AudioServer.remove_bus(bus)

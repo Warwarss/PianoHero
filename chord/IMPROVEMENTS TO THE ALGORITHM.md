@@ -2,6 +2,8 @@
 
 When playing C4 also triggers C5, the first question is **when C5 appears**. A one-frame flash, an extra note that persists throughout the sound, and a missed C5 struck over a ringing C4 point to different experiments. This guide connects those observations to four extensions cited by Dessein, Cont and Lemaitre. The Bayesian method is Bertin et al. [3]. The separate 2016 paper by Cheng et al. models the hammer attack and the ringing string. [Original bibliography](https://archives.ismir.net/ismir2010/paper/000083.pdf#page=6)
 
+The proposals below were written for the earlier squared-error baseline. The current build uses the paper’s Equation 12 with the β slider. **Guided microphone test** captures a WAV and per-window results for the piano experiments described here. [Current controls and recording format](SOURCES.md)
+
 ## Where is the gain in NMF?
 
 For one instant, our detector fits $v_t \approx W h_t$. Stacking those instants as columns gives $V \approx WH$ for the recording.

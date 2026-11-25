@@ -30,7 +30,7 @@ Here \(f\) is the fundamental frequency, \(a_n\) is the amplitude of harmonic \(
 
 The Fourier transform asks how much the signal resembles oscillations at different frequencies. The FFT is an efficient way to compute that transform. For each frequency bin, the FFT returns a complex number that carries magnitude and phase. Taking the absolute value leaves a magnitude for each bin.
 
-In our code, a typical 50 ms recording window is averaged into 1,024 mono samples at an analysis rate of 20,480 samples per second. We apply a Hann window, which fades the edges of the 50 ms segment, before taking the FFT. The bin spacing is \(20{,}480/1{,}024=20\) Hz. The resulting array keeps 512 magnitude bins, zeros the DC bin, and applies a small weighting that increases with frequency.
+In our code, a typical 50 ms recording window is averaged into 1,024 mono samples at 20,480 samples per second. We apply the selected Hann, Hamming, Blackman, or Kaiser window and pad with 1,024 zeros for a 2,048-point FFT. The resulting 10 Hz grid samples the same 50 ms spectrum more densely. The detector keeps 1,024 magnitude bins, zeros the DC bin, and applies a small weighting that increases with frequency.
 
 You can read a spectrum like a bar chart. A tone at 261.6 Hz contributes most near the 260 Hz bin. A tone near 523.3 Hz contributes most near the 520 Hz bin. A real tone usually spreads over several nearby bins because we measured a finite window and the frequency may land between bin centers. An FFT peak tells us where the sound has energy. It carries no label for the key that produced it. [Godot spectral processing](chord_detector.gd#L114)
 
@@ -97,9 +97,9 @@ $$
 
 If we increase the C4 gain, both bins get stronger. We would improve the shared bin at the cost of overshooting the C4-only bin. If we increase the C5 gain, only the shared bin gets stronger in this example. The residual therefore offers the solver a reason to add C5.
 
-### Now include the actual penalty
+### Worked example with the previous squared-error solver
 
-The code minimizes this objective for each window.
+The previous solver minimized this objective for each window.
 
 $$
 J(h)=\frac12\sum_b\big(y_b-(Wh)_b\big)^2+\lambda\sum_j h_j,
@@ -123,6 +123,12 @@ The two-key fit wins this comparison. Even if we give the one-key fit its best p
 **The fitter can solve its math correctly and still report the wrong key.** Its objective rewards a good match to the measured spectrum. If the C4 template's shape is inaccurate for this strike, a combination of columns can fit better than the physical explanation. Octave insertions are a documented issue in fixed-template piano transcription. [Real-time piano NMF paper, Sections 3–4](https://archives.ismir.net/ismir2010/paper/000083.pdf)
 
 ## 5. Map the math to the Godot code
+
+The current detector uses the paper’s Equation 12. Each iteration multiplies the gain by the ratio of the observation and prediction terms. The β slider changes the powers of the prediction in that ratio. For immediate detection, a key must exceed 21% of the frame’s peak gain. For partials 2 through 10, the higher key must also reach 38% of the accepted lower key’s gain. A weaker candidate one octave above the strongest reported key can qualify by reaching 10% of that key’s gain over three consecutive analyzed windows. This leaves a stricter immediate check on brief peaks while giving persistent weak octaves a way through. [Current detector](chord_detector.gd) · [Equation 12](https://archives.ismir.net/ismir2010/paper/000083.pdf#page=3)
+
+### Previous solver implementation
+
+The table and derivation below refer to the earlier squared-error implementation used in the worked example. That version used coordinate descent, a Gram matrix, and a squared-error fitness threshold.
 
 | Code | What it means |
 |---|---|
@@ -176,7 +182,7 @@ $$
 
 A note needs a fitness of at least 0.04 to appear. This measures the contribution to the fit at the current gains. It is distinct from the strength shown in the UI, which divides a key's gain by the strongest gain in the frame.
 
-### How the current detector handles octaves
+### How the previous detector handled octaves
 
 Both solvers fit the full prepared spectrum. The detector then checks the relative gain and fitness of each candidate. A filter for weak candidates that align with harmonics **3 through 10** of a lower reported key also applies. For C4 and C5, the decision comes from the gain and fitness checks. [Optimization and post-filter code](chord_detector.gd)
 

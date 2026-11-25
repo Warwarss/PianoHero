@@ -1,6 +1,7 @@
 [gd_scene format=3]
 
 [ext_resource type="Script" path="res://lab.gd" id="1"]
+[ext_resource type="Script" path="res://chord/attack_decay/take_panel.gd" id="2"]
 
 [sub_resource type="AudioStreamMicrophone" id="Mic"]
 
@@ -69,10 +70,62 @@ text = "Replay test"
 size_flags_horizontal = 3
 tooltip_text = "Analyze labeled recordings without using the microphone."
 
-[node name="Solver" type="OptionButton" parent="Margin/Scroll/Column"]
+[node name="ChordSettings" type="VBoxContainer" parent="Margin/Scroll/Column"]
+unique_name_in_owner = true
+visible = false
+theme_override_constants/separation = 6
+
+[node name="BetaLabel" type="Label" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+text = "Live β divergence · 0.50"
+
+[node name="Beta" type="HSlider" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 32)
+max_value = 2.0
+step = 0.05
+value = 0.5
+
+[node name="AnalysisWindow" type="OptionButton" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 44)
+
+[node name="AttackTime" type="SpinBox" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 40)
+prefix = "Attack"
+suffix = "ms"
+min_value = 10.0
+max_value = 80.0
+step = 10.0
+value = 20.0
+
+[node name="SpectrumTime" type="SpinBox" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 40)
+prefix = "Spectrum"
+suffix = "ms"
+min_value = 20.0
+max_value = 100.0
+step = 10.0
+value = 40.0
+
+[node name="GuidedTest" type="Button" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 44)
+text = "Guided microphone test"
+tooltip_text = "Follow the note prompts and save microphone audio and detector results locally."
+
+[node name="GuidedPrompt" type="Label" parent="Margin/Scroll/Column/ChordSettings"]
+unique_name_in_owner = true
+visible = false
+autowrap_mode = 3
+
+[node name="GuidedRecord" type="Button" parent="Margin/Scroll/Column/ChordSettings"]
 unique_name_in_owner = true
 visible = false
 custom_minimum_size = Vector2(0, 44)
+text = "Record"
 
 [node name="Profile" type="CheckButton" parent="Margin/Scroll/Column"]
 unique_name_in_owner = true
@@ -92,8 +145,14 @@ size_flags_horizontal = 3
 
 [node name="Learn" type="Button" parent="Margin/Scroll/Column/LearningControls"]
 unique_name_in_owner = true
-text = "Learn"
+text = "Calibrate keys"
 size_flags_horizontal = 3
+
+[node name="RetryKey" type="Button" parent="Margin/Scroll/Column"]
+unique_name_in_owner = true
+visible = false
+custom_minimum_size = Vector2(0, 44)
+text = "Retry current key"
 
 [node name="Hint" type="Label" parent="Margin/Scroll/Column"]
 unique_name_in_owner = true
@@ -105,6 +164,11 @@ theme_override_styles/panel = SubResource("Card")
 
 [node name="Readout" type="VBoxContainer" parent="Margin/Scroll/Column/Card"]
 alignment = 1
+
+[node name="LiveHeading" type="Label" parent="Margin/Scroll/Column/Card/Readout"]
+unique_name_in_owner = true
+visible = false
+text = "Template NMF · active keys"
 
 [node name="Note" type="Label" parent="Margin/Scroll/Column/Card/Readout"]
 unique_name_in_owner = true
@@ -119,6 +183,71 @@ unique_name_in_owner = true
 autowrap_mode = 3
 text = "No pitch"
 horizontal_alignment = 1
+
+[node name="AttackDecay" type="PanelContainer" parent="Margin/Scroll/Column"]
+unique_name_in_owner = true
+visible = false
+theme_override_styles/panel = SubResource("Card")
+script = ExtResource("2")
+
+[node name="Content" type="VBoxContainer" parent="Margin/Scroll/Column/AttackDecay"]
+theme_override_constants/separation = 6
+
+[node name="Heading" type="Label" parent="Margin/Scroll/Column/AttackDecay/Content"]
+text = "Attack/decay NMF · strikes"
+
+[node name="TakeStatus" type="Label" parent="Margin/Scroll/Column/AttackDecay/Content"]
+unique_name_in_owner = true
+text = "Record up to 8 seconds. Strike times appear after the fit."
+autowrap_mode = 3
+
+[node name="EventsScroll" type="ScrollContainer" parent="Margin/Scroll/Column/AttackDecay/Content"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 78)
+horizontal_scroll_mode = 0
+
+[node name="TakeEvents" type="Label" parent="Margin/Scroll/Column/AttackDecay/Content/EventsScroll"]
+unique_name_in_owner = true
+size_flags_horizontal = 3
+autowrap_mode = 3
+theme_override_colors/font_color = Color(0.57, 0.94, 0.81, 1)
+
+[node name="Buttons" type="HBoxContainer" parent="Margin/Scroll/Column/AttackDecay/Content"]
+
+[node name="FollowButton" type="Button" parent="Margin/Scroll/Column/AttackDecay/Content/Buttons"]
+unique_name_in_owner = true
+size_flags_horizontal = 3
+custom_minimum_size = Vector2(0, 44)
+text = "Follow strikes"
+
+[node name="TakeButton" type="Button" parent="Margin/Scroll/Column/AttackDecay/Content/Buttons"]
+unique_name_in_owner = true
+size_flags_horizontal = 3
+custom_minimum_size = Vector2(0, 44)
+text = "Record a take"
+
+[node name="ChooseBank" type="OptionButton" parent="Margin/Scroll/Column/AttackDecay/Content"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 44)
+fit_to_longest_item = false
+tooltip_text = "Choose the piano used to train the attack and decay templates."
+
+[node name="BankDialog" type="FileDialog" parent="Margin/Scroll/Column/AttackDecay"]
+unique_name_in_owner = true
+title = "Load a trained attack/decay piano bank"
+file_mode = 0
+access = 2
+filters = PackedStringArray("*.npz ; Attack/decay bank")
+
+[node name="TrainBank" type="Button" parent="Margin/Scroll/Column/AttackDecay/Content"]
+unique_name_in_owner = true
+visible = false
+text = "Train from saved calibration"
+
+[node name="TrainingStatus" type="Label" parent="Margin/Scroll/Column/AttackDecay/Content"]
+unique_name_in_owner = true
+visible = false
+autowrap_mode = 3
 
 [node name="InputLabel" type="Label" parent="Margin/Scroll/Column"]
 text = "Microphone level"
