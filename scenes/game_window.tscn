@@ -1,0 +1,69 @@
+[gd_scene format=3 uid="uid://b41hh7jmirxn"]
+
+[ext_resource type="Script" uid="uid://btrbc7yvc1rl5" path="res://scripts/game_scene_logic.gd" id="1_2blu7"]
+[ext_resource type="Texture2D" uid="uid://dfxsln8sgswti" path="res://resources/backgrounds/2025mspiff_Brokeback-Mountain_1920x1080.jpg" id="2_wyien"]
+[ext_resource type="PackedScene" path="res://scenes/lab.tscn" id="2_xqmpp"]
+[ext_resource type="FontFile" uid="uid://dg8nwekdjrnj7" path="res://resources/fonts/Eastwood_Recreated.ttf" id="3_5snyb"]
+[ext_resource type="Script" uid="uid://djos5uyhr80nu" path="res://scripts/audio_manager.gd" id="5_7wq2k"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_7wq2k"]
+bg_color = Color(0.030298993, 0.048608504, 0.18855631, 1)
+
+[node name="GameWindow" type="Control" unique_id=1952261107]
+layout_mode = 3
+anchors_preset = 0
+script = ExtResource("1_2blu7")
+lab = ExtResource("2_xqmpp")
+
+[node name="Background" type="TextureRect" parent="." unique_id=1970104340]
+z_index = -10
+layout_mode = 0
+offset_right = 1920.0
+offset_bottom = 1080.0
+texture = ExtResource("2_wyien")
+
+[node name="VBoxContainer" type="VBoxContainer" parent="." unique_id=1451771175]
+layout_mode = 0
+offset_left = 511.0
+offset_top = 665.0
+offset_right = 1347.0
+offset_bottom = 955.0
+alignment = 1
+
+[node name="Play" type="Button" parent="VBoxContainer" unique_id=2000211284]
+z_index = 1
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_5snyb")
+theme_override_font_sizes/font_size = 50
+theme_override_styles/hover = SubResource("StyleBoxFlat_7wq2k")
+action_mode = 0
+text = "OYNA"
+
+[node name="Calibrate" type="Button" parent="VBoxContainer" unique_id=1882492997]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_5snyb")
+theme_override_font_sizes/font_size = 50
+action_mode = 0
+text = "KALIBRASYON"
+
+[node name="Fart" type="Button" parent="VBoxContainer" unique_id=1999269970]
+layout_mode = 2
+theme_override_fonts/font = ExtResource("3_5snyb")
+theme_override_font_sizes/font_size = 50
+action_mode = 0
+text = "OSUR"
+
+[node name="Title" type="Label" parent="." unique_id=1315230048]
+layout_mode = 0
+offset_left = 335.0
+offset_top = 109.0
+offset_right = 1619.0
+offset_bottom = 309.0
+rotation = 0.004372262
+theme_override_colors/font_color = Color(1, 0, 1, 1)
+theme_override_fonts/font = ExtResource("3_5snyb")
+theme_override_font_sizes/font_size = 200
+text = "DEADNOTE SALOON"
+
+[node name="AudioManager" type="Node" parent="." unique_id=1725356336]
+script = ExtResource("5_7wq2k")

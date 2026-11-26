@@ -11,7 +11,7 @@ config_version=5
 [application]
 
 config/name="Piano Input Lab"
-run/main_scene="res://lab.tscn"
+run/main_scene="res://scenes/lab.tscn"
 config/features=PackedStringArray("4.7", "GL Compatibility")
 
 [audio]
@@ -19,10 +19,14 @@ config/features=PackedStringArray("4.7", "GL Compatibility")
 general/ios/session_category=2
 driver/enable_input=true
 
+[autoload]
+
+AudioManager="*uid://djos5uyhr80nu"
+
 [display]
 
-window/size/viewport_width=384
-window/size/viewport_height=620
+window/size/viewport_width=1920
+window/size/viewport_height=1080
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 window/handheld/orientation=1
@@ -31,5 +35,5 @@ window/handheld/orientation=1
 
 renderer/rendering_method="gl_compatibility"
 renderer/rendering_method.mobile="gl_compatibility"
-environment/defaults/default_clear_color=Color(0.055, 0.09, 0.11, 1)
 textures/vram_compression/import_etc2_astc=true
+environment/defaults/default_clear_color=Color(0.055, 0.09, 0.11, 1)
