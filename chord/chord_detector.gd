@@ -1,11 +1,13 @@
 extends RefCounted
 ## Online fixed-dictionary NMF. Each 50 ms spectrum is fitted as W * h,
 ## where W contains measured piano spectra and h contains nonnegative gains.
+
+const MusicUtils := preload("res://audio/music_utils.gd")
 const BANKS := [
-	preload("res://chord/templates.tres"),
-	preload("res://chord/templates_hamming.tres"),
-	preload("res://chord/templates_blackman.tres"),
-	preload("res://chord/templates_kaiser4.tres"),
+	preload("res://chord/templates/templates.tres"),
+	preload("res://chord/templates/templates_hamming.tres"),
+	preload("res://chord/templates/templates_blackman.tres"),
+	preload("res://chord/templates/templates_kaiser4.tres"),
 ]
 const KAISER_SHAPE := 4.0
 const FRAME_SIZE := 1024
@@ -14,10 +16,10 @@ const BINS := FFT_SIZE >> 1
 const RATE := 20480.0
 const WINDOW_SECONDS := FRAME_SIZE / RATE
 const HOP_SECONDS := 0.010
-const KEYS := 88
-const FIRST_KEY := 21
+const KEYS := MusicUtils.KEYS
+const FIRST_KEY := MusicUtils.FIRST_KEY
 const BETA_UPDATES := 12
-const GATE_DB := -55.0
+const GATE_DB := MusicUtils.GATE_DB
 const OCTAVE_SEMITONES := 12
 const SOFT_OCTAVE_GAIN_RATIO := 0.10
 const SOFT_OCTAVE_CONFIRMATIONS := 3
@@ -87,6 +89,17 @@ static func _bessel_i0(x: float) -> float:
 		sum += term
 	return sum
 
+static func _in_harmonic_band(bin: int, midi: int, a4_hz: float) -> bool:
+	# Mirror the inharmonicity-aware harmonic mask used in tools/build_chord_assets.mjs
+	# so personal templates exclude broadband room noise and hum.
+	var f0 := MusicUtils.midi_to_hz(midi, a4_hz)
+	var bin_hz := RATE / FFT_SIZE
+	var window_hz := RATE / FRAME_SIZE
+	var hz := bin * bin_hz
+	var partial := maxi(1, roundi(hz / f0))
+	var distance := hz - partial * f0
+	return not (distance < -1.7 * window_hz - 0.006 * hz or distance > 1.7 * window_hz + 0.02 * hz)
+
 func configure(a4: float, personal_templates: Dictionary = {}, analysis_window := Taper.HANN) -> void:
 	reset()
 	if is_equal_approx(a4, tuning) and personal_templates == configured_templates and window == analysis_window:
@@ -99,17 +112,20 @@ func configure(a4: float, personal_templates: Dictionary = {}, analysis_window :
 	measured_columns.clear()
 	var bank: PackedByteArray = BANKS[window].get_meta("spectra")
 	for key in KEYS:
+		var midi := FIRST_KEY + key
 		var bins := PackedInt32Array()
 		var values := PackedFloat32Array()
 		var norm := 0.0
-		var personal: PackedFloat32Array = personal_templates.get(FIRST_KEY + key, PackedFloat32Array())
+		var personal: PackedFloat32Array = personal_templates.get(midi, PackedFloat32Array())
 		var personal_peak := 0.0
-		for value in personal:
-			personal_peak = maxf(personal_peak, value)
+		for b in range(1, mini(BINS, personal.size())):
+			if _in_harmonic_band(b, midi, a4):
+				personal_peak = maxf(personal_peak, personal[b])
+		var use_personal := not personal.is_empty() and personal_peak > 0.0
 		for b in range(1, BINS):
 			var value := 0.0
-			if personal.is_empty():
-				var source := b * 440.0 / a4
+			if not use_personal:
+				var source := b * MusicUtils.STANDARD_A4 / a4
 				var left := floori(source)
 				if left + 1 >= BINS:
 					break
@@ -117,7 +133,7 @@ func configure(a4: float, personal_templates: Dictionary = {}, analysis_window :
 				var amplitude := lerpf(bank[row], bank[row + 1], source - left) / 255.0
 				if amplitude >= 0.13:
 					value = amplitude * amplitude * bin_weights[b]
-			elif personal[b] >= 0.02 * personal_peak:
+			elif b < personal.size() and _in_harmonic_band(b, midi, a4) and personal[b] >= 0.02 * personal_peak:
 				# These bins already contain the recorded tuning and weighting.
 				value = personal[b]
 			if value <= 0.0:
@@ -126,8 +142,9 @@ func configure(a4: float, personal_templates: Dictionary = {}, analysis_window :
 			bins.append(b)
 			values.append(value)
 		norm = sqrt(norm)
-		for i in values.size():
-			values[i] /= norm
+		if norm > 0.0:
+			for i in values.size():
+				values[i] /= norm
 		indices.append(bins)
 		columns.append(values)
 		var products := PackedFloat32Array()
@@ -140,23 +157,25 @@ func reset() -> void:
 	confirmation.reset()
 	analysis_ms = 0.0
 
-static func input_level_db(frames: PackedVector2Array) -> float:
-	var power := 0.0
-	for frame in frames:
-		power += frame.length_squared() * 0.5
-	return linear_to_db(maxf(0.000001, sqrt(power / frames.size())))
-
 func analyze_frame(frames: PackedVector2Array, audio_ms := -1.0) -> Dictionary:
 	var start := Time.get_ticks_usec()
-	var db := input_level_db(frames)
+	var db := MusicUtils.input_level_db(frames)
+	var silent := db < GATE_DB
 	var keys := {}
-	if db >= GATE_DB:
-		keys = estimate(frames)
+	if silent:
+		gains.fill(0.0)
+		octave_confirmations.fill(0)
 	else:
-		reset()
+		keys = estimate(frames)
 	analysis_ms = audio_ms if audio_ms >= 0.0 else analysis_ms + 1000.0 * HOP_SECONDS
-	var confirmed := confirmation.update(keys, gains, FIRST_KEY, analysis_ms)
-	return {"db": db, "keys": confirmed, "raw_keys": keys, "usec": Time.get_ticks_usec() - start}
+	var confirmed := confirmation.update(keys, gains, FIRST_KEY, analysis_ms, silent)
+	return {
+		"db": db,
+		"keys": confirmed,
+		"raw_keys": keys,
+		"onsets": confirmation.last_onsets.duplicate(),
+		"usec": Time.get_ticks_usec() - start,
+	}
 
 func measure_template(frames: PackedVector2Array, analysis_window: Taper) -> PackedFloat32Array:
 	_spectrum(frames, analysis_window)
@@ -206,7 +225,8 @@ func _spectrum(frames: PackedVector2Array, analysis_window: Taper) -> void:
 ## Returns {MIDI key: fitted strength relative to the strongest active key}.
 func estimate(frames: PackedVector2Array) -> Dictionary:
 	if frames.is_empty() or columns.is_empty():
-		reset()
+		gains.fill(0.0)
+		octave_confirmations.fill(0)
 		return {}
 	_spectrum(frames, window)
 	var correlation := PackedFloat32Array()
@@ -223,7 +243,10 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 		correlation.append(score)
 		strongest = maxf(strongest, score)
 	if strongest <= 0.001 or strongest < 0.32 * sqrt(power):
-		reset()
+		# Damp gains on a noisy/transient frame without wiping confirmation state.
+		for key in KEYS:
+			gains[key] *= 0.5
+		octave_confirmations.fill(0)
 		return {}
 
 	_fit_beta(correlation, strongest)
@@ -261,28 +284,59 @@ func estimate(frames: PackedVector2Array) -> Dictionary:
 	return result
 
 func _fit_beta(correlation: PackedFloat32Array, strongest: float) -> void:
-	var floor := 0.001 * strongest
+	var floor_val := 0.001 * strongest
 	# Itakura–Saito divergence at beta = 0 requires positive observations.
 	var observation_floor := 0.000001 * strongest if is_zero_approx(beta) else 0.0
 	for key in KEYS:
 		# Positive seeds let a key enter the fit again after fading out.
-		gains[key] = maxf(minf(gains[key], strongest), 0.15 * correlation[key] + floor)
+		gains[key] = maxf(minf(gains[key], strongest), 0.15 * correlation[key] + floor_val)
 		var bins := indices[key]
 		var shape := columns[key]
 		for i in bins.size():
 			# Equation 12 folds the observed spectrum into W once per frame.
 			measured_columns[key][i] = shape[i] * maxf(spectrum[bins[i]], observation_floor)
+	var beta_mode := 4
+	if is_equal_approx(beta, 0.5):
+		beta_mode = 0
+	elif is_equal_approx(beta, 1.0):
+		beta_mode = 1
+	elif is_equal_approx(beta, 2.0):
+		beta_mode = 2
+	elif is_zero_approx(beta):
+		beta_mode = 3
 	for _iteration in BETA_UPDATES:
-		predicted.fill(floor)
+		predicted.fill(floor_val)
 		for key in KEYS:
 			var bins := indices[key]
 			var shape := columns[key]
 			var gain := gains[key]
 			for i in bins.size():
 				predicted[bins[i]] += gain * shape[i]
-		for bin in range(1, BINS):
-			denominator_bins[bin] = pow(predicted[bin], beta - 1.0)
-			numerator_bins[bin] = denominator_bins[bin] / predicted[bin]
+		match beta_mode:
+			0:
+				for bin in range(1, BINS):
+					var p := predicted[bin]
+					var inv_sqrt := 1.0 / sqrt(p)
+					denominator_bins[bin] = inv_sqrt
+					numerator_bins[bin] = inv_sqrt / p
+			1:
+				for bin in range(1, BINS):
+					denominator_bins[bin] = 1.0
+					numerator_bins[bin] = 1.0 / predicted[bin]
+			2:
+				for bin in range(1, BINS):
+					denominator_bins[bin] = predicted[bin]
+					numerator_bins[bin] = 1.0
+			3:
+				for bin in range(1, BINS):
+					var inv := 1.0 / predicted[bin]
+					denominator_bins[bin] = inv
+					numerator_bins[bin] = inv * inv
+			_:
+				for bin in range(1, BINS):
+					var p := predicted[bin]
+					denominator_bins[bin] = pow(p, beta - 1.0)
+					numerator_bins[bin] = denominator_bins[bin] / p
 		for key in KEYS:
 			var numerator := 0.0
 			var denominator := 0.0

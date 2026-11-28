@@ -1,15 +1,15 @@
 extends Control
 
-const Detector := preload("res://pitch_detector.gd")
+const MusicUtils := preload("res://audio/music_utils.gd")
+const Detector := preload("res://audio/pitch_detector.gd")
 const ChordDetector := preload("res://chord/chord_detector.gd")
 const LiveChordWorker := preload("res://chord/live_chord_worker.gd")
 const ChordReplay := preload("res://chord/chord_replay.gd")
 const GuidedChordTest := preload("res://chord/guided_chord_test.gd")
 const KeyCalibration := preload("res://chord/key_calibration.gd")
-const NAMES := ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"]
 const ANDROID_MIC := "android.permission.RECORD_AUDIO"
-const GATE_DB := -55.0
-const STANDARD_A4 := 440.0
+const GATE_DB := MusicUtils.GATE_DB
+const STANDARD_A4 := MusicUtils.STANDARD_A4
 # Allow substantial detuning while excluding an accidental octave.
 const MIN_A4 := 390.0
 const MAX_A4 := 490.0
@@ -105,7 +105,7 @@ func _ready() -> void:
 	profile.toggled.connect(_profile_changed)
 	learn_key.add_item("All keys (A0–C8)", 0)
 	for key in range(ChordDetector.FIRST_KEY, ChordDetector.FIRST_KEY + ChordDetector.KEYS):
-		learn_key.add_item(_note_name(key), key)
+		learn_key.add_item(MusicUtils.note_name(key), key)
 	learn_key.select(0)
 	_load_templates()
 	get_tree().on_request_permissions_result.connect(_permission_result)
@@ -179,25 +179,9 @@ func _configure_live_worker() -> void:
 	live_chord_worker.configure(reference_hz, templates, analysis_window.selected as ChordDetector.Taper, chord_detector.beta,
 			chord_detector.confirmation.attack_ms, chord_detector.confirmation.spectral_ms)
 
-func _note_name(key: int) -> String:
-	return "%s%d" % [NAMES[key % 12], floori(key / 12.0) - 1]
-
 func _load_templates() -> void:
 	var config := ConfigFile.new()
 	if config.load(PROFILE_FILE) == OK:
-		if config.has_section("keys"):
-			for label in config.get_section_keys("keys"):
-				var key := label.to_int()
-				var values = config.get_value("keys", label)
-				if learn_key.get_item_index(key) > 0 and values is PackedFloat32Array and values.size() == ChordDetector.BINS / 2:
-					var interpolated := PackedFloat32Array()
-					interpolated.resize(ChordDetector.BINS)
-					for bin in ChordDetector.BINS:
-						var left := bin >> 1
-						interpolated[bin] = values[left]
-						if bin % 2 == 1 and left + 1 < values.size():
-							interpolated[bin] = 0.5 * (values[left] + values[left + 1])
-					piano_templates[ChordDetector.Taper.HANN][key] = interpolated
 		for window_index in TEMPLATE_SECTIONS.size():
 			var section: String = TEMPLATE_SECTIONS[window_index]
 			if not config.has_section(section):
@@ -214,7 +198,7 @@ func _update_profile_label() -> void:
 	profile.text = "Use my piano templates (%d/88)" % templates.size()
 	for index in range(1, learn_key.item_count):
 		var key := learn_key.get_item_id(index)
-		learn_key.set_item_text(index, _note_name(key) + (" ✓" if templates.has(key) else ""))
+		learn_key.set_item_text(index, MusicUtils.note_name(key) + (" ✓" if templates.has(key) else ""))
 
 func _profile_changed(_enabled: bool) -> void:
 	if listening:
@@ -242,9 +226,9 @@ func _begin_key(key: int, wait_for_release := false) -> void:
 	key_calibration = KeyCalibration.new(roundi(AudioServer.get_mix_rate()), wait_for_release)
 	discarded_at_start = capture.get_discarded_frames()
 	learn_deadline = Time.get_ticks_msec() + 25000
-	note.text = _note_name(key)
+	note.text = MusicUtils.note_name(key)
 	detail.text = "Release the keys and pedal"
-	status.text = "Learning %s" % _note_name(key)
+	status.text = "Learning %s" % MusicUtils.note_name(key)
 
 func _set_learning_controls(active: bool) -> void:
 	mode.disabled = active
@@ -287,9 +271,9 @@ func _learn_from_audio(frames: PackedVector2Array) -> void:
 		_retry_key("Strike was too brief · Release the key and try again at the prompt")
 		return
 	if key_calibration.onset >= 0:
-		detail.text = "Hold %s" % _note_name(learning_key)
+		detail.text = "Hold %s" % MusicUtils.note_name(learning_key)
 	elif key_calibration.armed:
-		detail.text = "Play %s once and hold it" % _note_name(learning_key)
+		detail.text = "Play %s once and hold it" % MusicUtils.note_name(learning_key)
 	if key_calibration.complete:
 		_save_learned_key()
 
@@ -335,11 +319,11 @@ func _save_learned_key() -> void:
 	elif not saved:
 		status.text = "Strike saved · Live templates could not be saved."
 	else:
-		status.text = "%s calibration saved" % _note_name(key)
+		status.text = "%s calibration saved" % MusicUtils.note_name(key)
 		detail.text = "Release the key"
 
 func _show_reference() -> void:
-	var cents := 1200.0 * log(reference_hz / STANDARD_A4) / log(2.0)
+	var cents := MusicUtils.cents_diff(reference_hz, STANDARD_A4)
 	tuning_label.text = "Reference A4   %.1f Hz   ·   %+.0f cents" % [reference_hz, cents]
 
 func _toggle_calibration() -> void:
@@ -492,10 +476,7 @@ func _process(delta: float) -> void:
 	var elapsed := fresh_frames / sample_rate
 	fresh_frames = 0
 	recent = recent.slice(-window_frames)
-	var energy := 0.0
-	for frame in recent:
-		energy += frame.length_squared() * 0.5
-	var db := linear_to_db(maxf(0.000001, sqrt(energy / recent.size())))
+	var db := MusicUtils.input_level_db(recent)
 	level.value = db
 	var start := Time.get_ticks_usec()
 	var tuning_ratio := 1.0 if calibrating else reference_hz / STANDARD_A4
@@ -510,9 +491,9 @@ func _process(delta: float) -> void:
 		detail.text = "No stable pitch"
 		status.text = "Low input · Check mic access or play closer" if db < GATE_DB else "Listening · Play one piano key"
 		return
-	var pitch := 69.0 + 12.0 * log(hz / reference_hz) / log(2.0)
+	var pitch := MusicUtils.hz_to_midi(hz, reference_hz)
 	var midi := roundi(pitch)
-	note.text = "%s%d" % [NAMES[midi % 12], floori(midi / 12.0) - 1]
+	note.text = MusicUtils.note_name(midi)
 	detail.text = "%.1f Hz   ·   %+.0f cents" % [hz, (pitch - midi) * 100.0]
 	status.text = "Listening · Pitch detected"
 
@@ -572,7 +553,7 @@ func _show_chord_result(keys: Dictionary, db: float, usec: int) -> void:
 	var names := PackedStringArray()
 	var strengths := PackedStringArray()
 	for key: int in keys:
-		var key_name := _note_name(key)
+		var key_name := MusicUtils.note_name(key)
 		names.append(key_name)
 		strengths.append("%s %d%%" % [key_name, roundi(100 * keys[key])])
 	note.text = "  ".join(names) if not names.is_empty() else "—"
@@ -670,6 +651,19 @@ func _finish_guided_test() -> void:
 	else:
 		%GuidedPrompt.text = "Could not save the test · %s" % error_string(error)
 
+func _set_replay_controls(active: bool) -> void:
+	mode.disabled = active
+	toggle.disabled = active
+	calibrate.disabled = active
+	learn.disabled = active
+	learn_key.disabled = active
+	profile.disabled = active
+	beta_slider.editable = not active
+	_set_confirmation_controls(not active)
+	analysis_window.disabled = active
+	guided_button.disabled = active
+	replay_button.text = "Stop replay" if active else "Replay test"
+
 func _toggle_replay() -> void:
 	if replay != null:
 		_end_replay()
@@ -678,20 +672,11 @@ func _toggle_replay() -> void:
 	if listening:
 		_stop()
 	replay = ChordReplay.new()
-	%AttackDecay.analyze_replay(replay.samples, ChordReplay.AUDIO.mix_rate)
+	%AttackDecay.analyze_replay(replay.samples, ChordReplay.AUDIO.mix_rate, true)
 	replay_time = ChordReplay.WINDOW_MS / 1000.0
 	chord_detector.configure(STANDARD_A4, {}, analysis_window.selected as ChordDetector.Taper)
 	tuning_label.text = "Replay reference A4   440 Hz"
-	mode.disabled = true
-	toggle.disabled = true
-	calibrate.disabled = true
-	learn.disabled = true
-	profile.disabled = true
-	beta_slider.editable = false
-	_set_confirmation_controls(false)
-	analysis_window.disabled = true
-	guided_button.disabled = true
-	replay_button.text = "Stop replay"
+	_set_replay_controls(true)
 
 func _advance_replay(delta: float) -> void:
 	replay_time += delta
@@ -708,13 +693,7 @@ func _advance_replay(delta: float) -> void:
 
 func _end_replay() -> void:
 	replay = null
-	mode.disabled = false
-	toggle.disabled = false
-	calibrate.disabled = false
-	beta_slider.editable = true
-	_set_confirmation_controls(true)
-	analysis_window.disabled = false
-	replay_button.text = "Replay test"
+	_set_replay_controls(false)
 	_stop()
 	_show_reference()
 
@@ -739,7 +718,7 @@ func _sample_calibration(hz: float, elapsed: float) -> void:
 		return
 
 	pitches.append(hz)
-	if 1200.0 * log(pitches.max() / pitches.min()) / log(2.0) > MAX_SPREAD_CENTS:
+	if MusicUtils.cents_diff(pitches.max(), pitches.min()) > MAX_SPREAD_CENTS:
 		pitches.assign([hz])
 		stable_seconds = 0.0
 	# A stalled UI frame only provides one analyzed window of evidence.

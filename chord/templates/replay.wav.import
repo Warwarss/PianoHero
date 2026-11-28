@@ -7,7 +7,7 @@ path="res://.godot/imported/replay.wav-e79dad3ee2ccee6f2f1d9cbcef2e6394.sample"
 
 [deps]
 
-source_file="res://chord/replay.wav"
+source_file="res://chord/templates/replay.wav"
 dest_files=["res://.godot/imported/replay.wav-e79dad3ee2ccee6f2f1d9cbcef2e6394.sample"]
 
 [params]

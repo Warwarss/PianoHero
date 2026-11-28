@@ -1,5 +1,6 @@
 ﻿"""Numerical regression checks for the paper's convolution, DP and training pipeline."""
 import itertools
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from chord.attack_decay import model
 
 

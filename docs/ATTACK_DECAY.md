@@ -56,4 +56,4 @@ Save this as `notes.json` next to the WAVs, edit the example times, then run the
 python tools/build_attack_decay_bank.py path/to/notes.json --output my-piano.npz
 ```
 
-To rebuild the bundled bank, pass the decoded Salamander directory described in [the audio credits](../SOURCES.md) in place of the manifest.
+To rebuild the bundled bank, pass the decoded Salamander directory described in [the audio credits](SOURCES.md) in place of the manifest.

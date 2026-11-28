@@ -85,12 +85,12 @@ function buildTemplates(windowAt, output) {
   fs.writeFileSync(output, '[gd_resource type="Resource" format=3]\n\n[resource]\nmetadata/spectra = PackedByteArray("' + templates.toString('base64') + '")\n');
 }
 
-buildTemplates(x => 0.5 - 0.5 * Math.cos(2 * Math.PI * x), 'chord/templates.tres');
-buildTemplates(x => 0.54 - 0.46 * Math.cos(2 * Math.PI * x), 'chord/templates_hamming.tres');
-buildTemplates(x => 0.42 - 0.5 * Math.cos(2 * Math.PI * x) + 0.08 * Math.cos(4 * Math.PI * x), 'chord/templates_blackman.tres');
+buildTemplates(x => 0.5 - 0.5 * Math.cos(2 * Math.PI * x), 'chord/templates/templates.tres');
+buildTemplates(x => 0.54 - 0.46 * Math.cos(2 * Math.PI * x), 'chord/templates/templates_hamming.tres');
+buildTemplates(x => 0.42 - 0.5 * Math.cos(2 * Math.PI * x) + 0.08 * Math.cos(4 * Math.PI * x), 'chord/templates/templates_blackman.tres');
 const kaiserShape = 4;
 const kaiserCenter = besselI0(kaiserShape);
-buildTemplates(x => besselI0(kaiserShape * Math.sqrt(1 - (2 * x - 1) ** 2)) / kaiserCenter, 'chord/templates_kaiser4.tres');
+buildTemplates(x => besselI0(kaiserShape * Math.sqrt(1 - (2 * x - 1) ** 2)) / kaiserCenter, 'chord/templates/templates_kaiser4.tres');
 
 // Independent MS Basic recordings. Its available anchors span B1–C#6,
 // so the two extreme-register fixtures use transposed recordings.
@@ -130,4 +130,4 @@ wav.writeUInt32LE(wavRate, 24); wav.writeUInt32LE(2 * wavRate, 28);
 wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36);
 wav.writeUInt32LE(mix.length * 2, 40);
 for (let i = 0; i < mix.length; i++) wav.writeInt16LE(Math.round(11000 * mix[i]), 44 + 2 * i);
-fs.writeFileSync('chord/replay.wav', wav);
+fs.writeFileSync('chord/templates/replay.wav', wav);

@@ -1,5 +1,6 @@
 extends RefCounted
 
+const MusicUtils := preload("res://audio/music_utils.gd")
 const PROFILE_DIR := "user://attack-decay/calibration"
 const HOLD_SECONDS := 1.4
 const QUIET_BLOCKS := 50
@@ -38,12 +39,8 @@ func append(frames: PackedVector2Array) -> void:
 	pending = pending.slice(offset) if not complete and not rejected else PackedVector2Array()
 
 func _process_block(block: PackedVector2Array) -> void:
-	var power := 0.0
-	for frame in block:
-		var mono := (frame.x + frame.y) * 0.5
-		power += mono * mono
-	var rms := sqrt(power / block.size())
-	db = linear_to_db(maxf(rms, 0.00001))
+	var rms := MusicUtils.mono_rms(block)
+	db = MusicUtils.rms_to_dbfs(rms, 0.00001)
 	audio.append_array(block)
 	if onset >= 0:
 		var age := audio.size() - onset

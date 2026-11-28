@@ -12,6 +12,7 @@ const PERSONAL_BANK := WORK_DIR + "My piano.npz"
 const CALIBRATION_REPORT := WORK_DIR + "calibration-check.json"
 const STALE_BANK_MESSAGE := "My piano is out of date. Select another bank or wait for training."
 const RUNTIME_FILES := ["model.py", "run_take.py", DEFAULT_BANK]
+const MusicUtils := preload("res://audio/music_utils.gd")
 const KeyCalibration := preload("res://chord/key_calibration.gd")
 
 var recording := false
@@ -30,6 +31,7 @@ var rate := 44100
 var worker_pid := -1
 var trainer_pid := -1
 var training_path := ""
+var training_pending_switch := false
 var runtime_dir := ""
 var job_path := ""
 var bank_override := ""
@@ -44,10 +46,12 @@ func _ready() -> void:
 	%ChooseBank.add_item("Salamander grand · 88 keys")
 	var local_banks := ProjectSettings.globalize_path("res://build/attack-decay")
 	if desktop and DirAccess.dir_exists_absolute(local_banks):
-		for file in DirAccess.get_files_at(local_banks):
-			if file.get_extension().to_lower() == "npz":
-				_add_bank_option(local_banks.path_join(file))
-		%BankDialog.current_dir = local_banks
+		var dir := DirAccess.open(local_banks)
+		if dir != null:
+			for file in dir.get_files():
+				if file.get_extension().to_lower() == "npz":
+					_add_bank_option(local_banks.path_join(file))
+			%BankDialog.current_dir = local_banks
 	%ChooseBank.add_item("Browse for trained bank…")
 	%ChooseBank.item_selected.connect(_bank_choice)
 	%BankDialog.file_selected.connect(_load_bank_file)
@@ -66,22 +70,27 @@ func _ready() -> void:
 		if report is Dictionary:
 			_show_calibration_report(report)
 
+func _profile_dir() -> String:
+	return ProjectSettings.globalize_path(KeyCalibration.PROFILE_DIR)
+
 func _personal_bank_outdated() -> bool:
-	if not DirAccess.dir_exists_absolute(KeyCalibration.PROFILE_DIR):
+	var profile_dir := _profile_dir()
+	if not DirAccess.dir_exists_absolute(profile_dir):
 		return false
 	var bank_time := FileAccess.get_modified_time(PERSONAL_BANK)
-	for file in DirAccess.get_files_at(KeyCalibration.PROFILE_DIR):
-		if file.get_extension() == "pcm" and FileAccess.get_modified_time(KeyCalibration.PROFILE_DIR.path_join(file)) > bank_time:
+	for file in DirAccess.get_files_at(profile_dir):
+		if file.get_extension() == "pcm" and FileAccess.get_modified_time(profile_dir.path_join(file)) > bank_time:
 			return true
 	return false
 
 func _refresh_buttons() -> void:
 	var stale := desktop and _stale_bank_selected()
+	var profile_dir := _profile_dir()
 	%TakeButton.disabled = not desktop or worker_pid >= 0 or not input_available or following or (stale and not recording)
 	%FollowButton.disabled = not desktop or not input_available or recording or ((worker_pid >= 0 or stale) and not following)
 	%FollowButton.text = "Stop following" if following else "Follow strikes"
 	%ChooseBank.disabled = not desktop or worker_pid >= 0 or recording or following
-	%TrainBank.visible = desktop and DirAccess.dir_exists_absolute(KeyCalibration.PROFILE_DIR) and not DirAccess.get_files_at(KeyCalibration.PROFILE_DIR).is_empty()
+	%TrainBank.visible = desktop and DirAccess.dir_exists_absolute(profile_dir) and not DirAccess.get_files_at(profile_dir).is_empty()
 	%TrainBank.disabled = not training_path.is_empty() or not input_available
 	%TakeButton.text = "Finish and analyze" if recording else "Record a take"
 	if stale and worker_pid < 0 and not recording and not following:
@@ -176,6 +185,8 @@ func cancel_take(reason: String) -> void:
 		samples.clear()
 		%TakeStatus.text = reason
 		_refresh_buttons()
+		if training_pending_switch and worker_pid < 0:
+			_finish_training()
 
 func finish_take() -> void:
 	if following:
@@ -190,12 +201,14 @@ func finish_take() -> void:
 		_analyze(samples, rate, "Microphone")
 	samples.clear()
 	_refresh_buttons()
+	if training_pending_switch and worker_pid < 0:
+		_finish_training()
 
-func analyze_replay(frames: PackedVector2Array, sample_rate: int) -> void:
+func analyze_replay(frames: PackedVector2Array, sample_rate: int, use_default_bank := true) -> void:
 	if not desktop:
 		return
 	_stop_worker()
-	_analyze(frames, sample_rate, "Replay")
+	_analyze(frames, sample_rate, "Replay", use_default_bank)
 
 func _append_follow(frames: PackedVector2Array) -> void:
 	samples.append_array(frames)
@@ -253,15 +266,15 @@ func _python() -> String:
 			return path
 	return "python" if OS.get_name() == "Windows" else "python3"
 
-func _analyze(frames: PackedVector2Array, sample_rate: int, source: String) -> void:
+func _analyze(frames: PackedVector2Array, sample_rate: int, source: String, force_default_bank := false) -> void:
 	job_is_follow = following
-	if _stale_bank_selected():
+	if not force_default_bank and _stale_bank_selected():
 		%TakeEvents.text = ""
 		%TakeStatus.text = STALE_BANK_MESSAGE
 		return
 	if not _prepare_job():
 		return
-	var bank := runtime_dir.path_join(DEFAULT_BANK) if bank_override.is_empty() else bank_override
+	var bank := runtime_dir.path_join(DEFAULT_BANK) if (force_default_bank or bank_override.is_empty()) else bank_override
 	var pcm := FileAccess.open(job_path + ".pcm", FileAccess.WRITE)
 	if pcm == null:
 		%TakeStatus.text = "Could not write the take."
@@ -353,9 +366,9 @@ func _copy_asset(source: String, target: String) -> Error:
 func _process(_delta: float) -> void:
 	if worker_pid >= 0 and not OS.is_process_running(worker_pid):
 		_finish_analysis()
-	if not training_path.is_empty() and (trainer_pid < 0 or not OS.is_process_running(trainer_pid)):
+	if not training_path.is_empty() and not training_pending_switch and (trainer_pid < 0 or not OS.is_process_running(trainer_pid)):
 		_finish_training()
-	set_process(worker_pid >= 0 or not training_path.is_empty())
+	set_process(worker_pid >= 0 or (not training_path.is_empty() and not training_pending_switch))
 
 func _finish_analysis() -> void:
 	var result: Variant = null
@@ -378,12 +391,16 @@ func _finish_analysis() -> void:
 	worker_pid = -1
 	final_follow_fit = false
 	_refresh_buttons()
+	if training_pending_switch and not recording and not following:
+		_finish_training()
 
 func _finish_training() -> void:
 	trainer_pid = -1
 	if (worker_pid >= 0 or recording or following) and FileAccess.file_exists(training_path + ".bank.npz"):
+		training_pending_switch = true
 		%TrainingStatus.text = "Training finished. The bank will switch after this take."
 		return
+	training_pending_switch = false
 	var result: Variant = null
 	if FileAccess.file_exists(training_path + ".json"):
 		result = JSON.parse_string(FileAccess.get_file_as_string(training_path + ".json"))
@@ -417,27 +434,25 @@ func _show_calibration_report(report: Dictionary) -> void:
 		clean += int(check.clean)
 		hits += int(check.hit)
 		if not check.hit:
-			misses.append(_note_name(int(check.expected_midi)))
+			misses.append(MusicUtils.note_name(int(check.expected_midi)))
 	%TrainingStatus.show()
 	%TrainingStatus.text = "My piano check · %d/%d pitches found · %d clean takes" % [hits, checks.size(), clean]
 	%TrainingStatus.tooltip_text = ("Check " + ", ".join(misses) + "\n" if not misses.is_empty() else "") + ProjectSettings.globalize_path(CALIBRATION_REPORT)
 
-func _note_name(midi: int) -> String:
-	var pitch: String = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"][midi % 12]
-	return "%s%d" % [pitch, floori(midi / 12.0) - 1]
-
-func cancel_training() -> void:
+func cancel_training(update_ui := true) -> void:
 	if trainer_pid >= 0 and OS.is_process_running(trainer_pid):
 		OS.kill(trainer_pid)
 	trainer_pid = -1
+	training_pending_switch = false
 	if not training_path.is_empty():
 		for suffix in [".json", ".part", ".npz", ".bank.npz"]:
 			var path := training_path + str(suffix)
 			if FileAccess.file_exists(path):
 				DirAccess.remove_absolute(path)
 	training_path = ""
-	%TrainingStatus.hide()
-	_refresh_buttons()
+	if update_ui and is_inside_tree():
+		%TrainingStatus.hide()
+		_refresh_buttons()
 
 func _accept_follow(events: Array) -> void:
 	for event: Dictionary in events:
@@ -466,7 +481,7 @@ func _show_events(events: Array) -> void:
 		var frame := roundi(float(event.onset) / 0.02)
 		if not groups.has(frame):
 			groups[frame] = PackedStringArray()
-		groups[frame].append(_note_name(int(event.midi)))
+		groups[frame].append(MusicUtils.note_name(int(event.midi)))
 	var times := groups.keys()
 	times.sort()
 	times.reverse()
@@ -495,7 +510,7 @@ func _stop_worker() -> void:
 
 func _exit_tree() -> void:
 	_stop_worker()
-	cancel_training()
+	cancel_training(false)
 	if not OS.has_feature("editor") and not runtime_dir.is_empty():
 		for file in RUNTIME_FILES:
 			DirAccess.remove_absolute(runtime_dir.path_join(file))

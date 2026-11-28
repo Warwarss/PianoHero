@@ -1,7 +1,7 @@
 extends RefCounted
 ## Labeled, silent replay in audio time. Scoring begins at each case's
 ## scheduled onset. The solver sees only samples preceding each decision.
-const AUDIO: AudioStreamWAV = preload("res://chord/replay.wav")
+const AUDIO: AudioStreamWAV = preload("res://chord/templates/replay.wav")
 const CASES := [
 	["C4", [60]], ["C4 G4", [60, 67]], ["Soft E4 in C major", [60, 64, 67]],
 	["C4 C5", [60, 72]], ["E4 G4 over ringing C4", [60, 64, 67]],
